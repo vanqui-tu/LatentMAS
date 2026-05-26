@@ -102,49 +102,50 @@ def save_kv_cache(past_kv, save_path: str):
 
 
 # ---------------------------------------------------------------------------
-# Single-sample LatentMAS runner with logging
+# Batched LatentMAS runner with logging
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def run_latent_mas_single(
+def run_latent_mas_batch(
     model: ModelWrapper,
-    item: Dict,
+    items: List[Dict],
     agents: List[Agent],
     latent_steps: int,
     max_new_tokens: int,
     temperature: float,
     top_p: float,
     args,
-) -> Tuple[Dict, Optional[object]]:
-    """Run LatentMAS pipeline on a single item. Returns (result_dict, final_kv_cache)."""
+) -> List[Tuple[Dict, Optional[object]]]:
+    """Run LatentMAS pipeline on a batch of items. Returns list of (result_dict, final_kv_cache)."""
 
+    batch_size = len(items)
     past_kv = None
-    agent_logs = []
+    agent_traces: List[List[Dict]] = [[] for _ in range(batch_size)]
+    final_texts = [""] * batch_size
 
     for agent in agents:
         if args.prompt == "sequential":
-            messages = build_agent_message_sequential_latent_mas(
-                role=agent.role,
-                question=item["question"],
-                context="",
-                method="latent_mas",
-                args=args,
-            )
+            batch_messages = [
+                build_agent_message_sequential_latent_mas(
+                    role=agent.role, question=item["question"],
+                    context="", method="latent_mas", args=args,
+                )
+                for item in items
+            ]
         else:
-            messages = build_agent_message_hierarchical_latent_mas(
-                role=agent.role,
-                question=item["question"],
-                context="",
-                method="latent_mas",
-                args=args,
-            )
+            batch_messages = [
+                build_agent_message_hierarchical_latent_mas(
+                    role=agent.role, question=item["question"],
+                    context="", method="latent_mas", args=args,
+                )
+                for item in items
+            ]
+
         prompts, input_ids, attention_mask, tokens_batch = model.prepare_chat_batch(
-            [messages], add_generation_prompt=True
+            batch_messages, add_generation_prompt=True
         )
-        prompt_text = prompts[0]
 
         if agent.role != "judger":
-            # Latent generation
             past_kv = model.generate_latent_batch(
                 input_ids,
                 attention_mask=attention_mask,
@@ -152,16 +153,16 @@ def run_latent_mas_single(
                 past_key_values=past_kv,
             )
             kv_len = _past_length(past_kv)
-            agent_logs.append({
-                "name": agent.name,
-                "role": agent.role,
-                "prompt": prompt_text,
-                "latent_steps": latent_steps,
-                "kv_cache_length_after": kv_len,
-                "output": "(latent — no text output)",
-            })
+            for idx in range(batch_size):
+                agent_traces[idx].append({
+                    "name": agent.name,
+                    "role": agent.role,
+                    "prompt": prompts[idx],
+                    "latent_steps": latent_steps,
+                    "kv_cache_length_after": kv_len,
+                    "output": "(latent — no text output)",
+                })
         else:
-            # Judger: text generation conditioned on accumulated KV-cache
             past_for_decoding = past_kv if latent_steps > 0 else None
             generated_batch, _ = model.generate_text_batch(
                 input_ids,
@@ -171,47 +172,53 @@ def run_latent_mas_single(
                 top_p=top_p,
                 past_key_values=past_for_decoding,
             )
-            output_text = generated_batch[0].strip()
-            agent_logs.append({
-                "name": agent.name,
-                "role": agent.role,
-                "prompt": prompt_text,
-                "output": output_text,
-            })
+            for idx in range(batch_size):
+                output_text = generated_batch[idx].strip()
+                final_texts[idx] = output_text
+                agent_traces[idx].append({
+                    "name": agent.name,
+                    "role": agent.role,
+                    "prompt": prompts[idx],
+                    "output": output_text,
+                })
 
-    # Extract answer
-    final_text = agent_logs[-1]["output"]
+    # Extract answers and build results
+    outputs = []
+    for idx, item in enumerate(items):
+        final_text = final_texts[idx]
 
-    if args.task in ["mbppplus", "humanevalplus"]:
-        pred = extract_markdown_python_block(final_text)
-        gold = item.get("gold", "")
-        if pred is None:
-            ok = False
+        if args.task in ["mbppplus", "humanevalplus"]:
+            pred = extract_markdown_python_block(final_text)
+            gold = item.get("gold", "")
+            if pred is None:
+                ok = False
+            else:
+                python_code_to_exe = pred + "\n" + gold
+                ok, _ = run_with_timeout(python_code_to_exe, timeout=10)
+        elif args.task in ["aime2024", "aime2025"]:
+            pred = normalize_answer(extract_gsm8k_answer(final_text))
+            gold = item.get("gold", "")
+            try:
+                ok = (int(pred) == int(gold))
+            except (ValueError, TypeError):
+                ok = False
         else:
-            python_code_to_exe = pred + "\n" + gold
-            ok, _ = run_with_timeout(python_code_to_exe, timeout=10)
-    elif args.task in ["aime2024", "aime2025"]:
-        pred = normalize_answer(extract_gsm8k_answer(final_text))
-        gold = item.get("gold", "")
-        try:
-            ok = (int(pred) == int(gold))
-        except (ValueError, TypeError):
-            ok = False
-    else:
-        pred = normalize_answer(extract_gsm8k_answer(final_text))
-        gold = item.get("gold", "")
-        ok = (pred == gold) if (pred and gold) else False
+            pred = normalize_answer(extract_gsm8k_answer(final_text))
+            gold = item.get("gold", "")
+            ok = (pred == gold) if (pred and gold) else False
 
-    result = {
-        "question": item["question"],
-        "gold": gold,
-        "solution": item.get("solution", ""),
-        "prediction": pred,
-        "raw_output": final_text,
-        "correct": ok,
-        "agents": agent_logs,
-    }
-    return result, past_kv
+        result = {
+            "question": item["question"],
+            "gold": gold,
+            "solution": item.get("solution", ""),
+            "prediction": pred,
+            "raw_output": final_text,
+            "correct": ok,
+            "agents": agent_traces[idx],
+        }
+        outputs.append((result, past_kv))
+
+    return outputs
 
 
 # ---------------------------------------------------------------------------
@@ -272,11 +279,19 @@ def run_task(
         task_max_tokens = args.max_new_tokens_override
     print(f"  max_new_tokens: {task_max_tokens}")
 
-    for idx, item in enumerate(tqdm(dataset, desc=f"[{task_name}]")):
+    # Incremental results file (append per sample, survives crashes)
+    results_path = os.path.join(task_dir, "results.jsonl")
+    with open(results_path, "w", encoding="utf-8") as f:
+        pass  # truncate
+
+    bs = args.generate_bs
+    for batch_start in tqdm(range(0, len(dataset), bs), desc=f"[{task_name}]"):
+        batch_items = dataset[batch_start : batch_start + bs]
         t0 = time.time()
-        result, final_kv = run_latent_mas_single(
+
+        batch_outputs = run_latent_mas_batch(
             model=model,
-            item=item,
+            items=batch_items,
             agents=agents,
             latent_steps=args.latent_steps,
             max_new_tokens=task_max_tokens,
@@ -284,20 +299,29 @@ def run_task(
             top_p=args.top_p,
             args=args,
         )
+
         elapsed = time.time() - t0
+        per_sample_time = elapsed / len(batch_items)
         total_time += elapsed
-        result["time_sec"] = round(elapsed, 2)
-        result["sample_idx"] = idx
-        results.append(result)
 
-        # Save KV-cache per sample
-        if args.save_kv_cache and final_kv is not None:
-            kv_path = os.path.join(kv_dir, f"sample_{idx:04d}.pt")
-            save_kv_cache(final_kv, kv_path)
+        for i, (result, final_kv) in enumerate(batch_outputs):
+            idx = batch_start + i
+            result["time_sec"] = round(per_sample_time, 2)
+            result["sample_idx"] = idx
+            results.append(result)
 
-        # Print progress
-        status = "✓" if result["correct"] else "✗"
-        print(f"  [{status}] #{idx} | Pred: {result['prediction']} | Gold: {result['gold']} | {elapsed:.1f}s")
+            # Save KV-cache per sample (sliced from batch)
+            if args.save_kv_cache and final_kv is not None:
+                kv_path = os.path.join(kv_dir, f"sample_{idx:04d}.pt")
+                save_kv_cache(final_kv, kv_path)
+
+            # Append result immediately (crash-safe)
+            with open(results_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(result, ensure_ascii=False) + "\n")
+
+            # Print progress
+            status = "✓" if result["correct"] else "✗"
+            print(f"  [{status}] #{idx} | Pred: {result['prediction']} | Gold: {result['gold']} | {per_sample_time:.1f}s")
 
     # Compute metrics
     correct = sum(1 for r in results if r["correct"])
@@ -390,6 +414,8 @@ def main():
                         help="Top-p sampling (paper: 0.95)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--generate_bs", type=int, default=1,
+                        help="Batch size for generation (default 1 for per-sample KV saving)")
     parser.add_argument("--save_kv_cache", action="store_true",
                         help="Save KV-cache tensors per sample (warning: large files)")
     parser.add_argument("--output_dir", type=str, default=None,
@@ -417,6 +443,7 @@ def main():
     print(f"Device: {device}")
     print(f"Tasks: {args.tasks}")
     print(f"Max samples: {args.max_samples}")
+    print(f"Batch size: {args.generate_bs}")
     print(f"Latent steps: {args.latent_steps}")
     print(f"Realign: {args.latent_space_realign}")
     print(f"Seed: {args.seed}")
