@@ -25,15 +25,27 @@ from typing import Dict, List, Tuple, Optional
 import torch
 from tqdm import tqdm
 
-from data import load_gsm8k, load_arc_easy, load_arc_challenge
+from data import (
+    load_gsm8k,
+    load_arc_easy,
+    load_arc_challenge,
+    load_aime2024,
+    load_aime2025,
+    load_gpqa_diamond,
+    load_mbppplus,
+    load_humanevalplus,
+    load_medqa,
+)
 from methods import default_agents, Agent
 from models import ModelWrapper, _past_length
-from prompts import build_agent_message_sequential_latent_mas
+from prompts import build_agent_message_sequential_latent_mas, build_agent_message_hierarchical_latent_mas
 from utils import (
     auto_device,
     set_seed,
     extract_gsm8k_answer,
     normalize_answer,
+    extract_markdown_python_block,
+    run_with_timeout,
 )
 
 
@@ -110,13 +122,22 @@ def run_latent_mas_single(
     agent_logs = []
 
     for agent in agents:
-        messages = build_agent_message_sequential_latent_mas(
-            role=agent.role,
-            question=item["question"],
-            context="",
-            method="latent_mas",
-            args=args,
-        )
+        if args.prompt == "sequential":
+            messages = build_agent_message_sequential_latent_mas(
+                role=agent.role,
+                question=item["question"],
+                context="",
+                method="latent_mas",
+                args=args,
+            )
+        else:
+            messages = build_agent_message_hierarchical_latent_mas(
+                role=agent.role,
+                question=item["question"],
+                context="",
+                method="latent_mas",
+                args=args,
+            )
         prompts, input_ids, attention_mask, tokens_batch = model.prepare_chat_batch(
             [messages], add_generation_prompt=True
         )
@@ -160,9 +181,26 @@ def run_latent_mas_single(
 
     # Extract answer
     final_text = agent_logs[-1]["output"]
-    pred = normalize_answer(extract_gsm8k_answer(final_text))
-    gold = item.get("gold", "")
-    ok = (pred == gold) if (pred and gold) else False
+
+    if args.task in ["mbppplus", "humanevalplus"]:
+        pred = extract_markdown_python_block(final_text)
+        gold = item.get("gold", "")
+        if pred is None:
+            ok = False
+        else:
+            python_code_to_exe = pred + "\n" + gold
+            ok, _ = run_with_timeout(python_code_to_exe, timeout=10)
+    elif args.task in ["aime2024", "aime2025"]:
+        pred = normalize_answer(extract_gsm8k_answer(final_text))
+        gold = item.get("gold", "")
+        try:
+            ok = (int(pred) == int(gold))
+        except (ValueError, TypeError):
+            ok = False
+    else:
+        pred = normalize_answer(extract_gsm8k_answer(final_text))
+        gold = item.get("gold", "")
+        ok = (pred == gold) if (pred and gold) else False
 
     result = {
         "question": item["question"],
@@ -195,6 +233,18 @@ def run_task(
         dataset_iter = load_arc_easy(split="test")
     elif task_name == "arc_challenge":
         dataset_iter = load_arc_challenge(split="test")
+    elif task_name == "aime2024":
+        dataset_iter = load_aime2024(split="train")
+    elif task_name == "aime2025":
+        dataset_iter = load_aime2025(split="train")
+    elif task_name == "gpqa":
+        dataset_iter = load_gpqa_diamond(split="test")
+    elif task_name == "mbppplus":
+        dataset_iter = load_mbppplus(split="test")
+    elif task_name == "humanevalplus":
+        dataset_iter = load_humanevalplus(split="test")
+    elif task_name == "medqa":
+        dataset_iter = load_medqa(split="test")
     else:
         raise ValueError(f"Unsupported task: {task_name}")
 
@@ -322,10 +372,12 @@ def main():
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-8B",
                         help="HuggingFace model ID")
     parser.add_argument("--tasks", nargs="+", default=["gsm8k", "arc_easy"],
-                        choices=["gsm8k", "arc_easy", "arc_challenge"],
+                        choices=["gsm8k", "arc_easy", "arc_challenge", "aime2024", "aime2025", "gpqa", "mbppplus", "humanevalplus", "medqa"],
                         help="Tasks to evaluate")
     parser.add_argument("--max_samples", type=int, default=30,
                         help="Max samples per task (-1 for all)")
+    parser.add_argument("--prompt", type=str, choices=["sequential", "hierarchical"],
+                        default="sequential", help="MAS architecture: sequential or hierarchical")
     parser.add_argument("--latent_steps", type=int, default=10,
                         help="Number of latent reasoning steps per agent")
     parser.add_argument("--latent_space_realign", action="store_true",
@@ -347,7 +399,6 @@ def main():
 
     # Add fields expected by prompts.py and models.py
     args.task = None  # set per-task
-    args.prompt = "sequential"
     args.method = "latent_mas"
     args.think = False
 
