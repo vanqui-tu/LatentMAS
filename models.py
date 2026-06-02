@@ -13,6 +13,8 @@ except ImportError:
 
 
 def _ensure_pad_token(tokenizer: AutoTokenizer) -> None:
+    # Decoder-only models require LEFT padding for correct batched generation.
+    tokenizer.padding_side = "left"
     if tokenizer.pad_token_id is None:
         if tokenizer.eos_token is not None:
             tokenizer.pad_token = tokenizer.eos_token
@@ -228,7 +230,6 @@ class ModelWrapper:
             raise ValueError("input_ids must be 2D with shape [batch, seq_len]")
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids, device=self.device)
-        prompt_lengths = attention_mask.sum(dim=1).tolist()
         cache_position = None
         if past_key_values is not None:
             past_len = _past_length(past_key_values)
@@ -260,9 +261,11 @@ class ModelWrapper:
         )
         sequences = outputs.sequences
         generations: List[str] = []
-        for idx, length in enumerate(prompt_lengths):
-            length = int(length)
-            generated_ids = sequences[idx, length:]
+        # With left padding, every row's prompt occupies the same number of
+        # leading columns, so generated tokens start at input_ids.shape[1].
+        prompt_width = input_ids.shape[1]
+        for idx in range(sequences.shape[0]):
+            generated_ids = sequences[idx, prompt_width:]
             text = self.tokenizer.decode(generated_ids, skip_special_tokens=skip_special_tokens).strip()
             generations.append(text)
         return generations, outputs.past_key_values
@@ -311,18 +314,10 @@ class ModelWrapper:
         )
         past = outputs.past_key_values
 
-        # If past_key_values is None, we might have padding.
-        if past_key_values is None:
-             # Identify last token index
-             # attention_mask (at this point, if past is None, it is just original mask)
-             last_token_indices = attention_mask.sum(1) - 1
-             batch_indices = torch.arange(input_ids.shape[0], device=input_ids.device)
-             e_t = outputs.hidden_states[0][batch_indices, last_token_indices, :]
-             last_hidden = outputs.hidden_states[-1][batch_indices, last_token_indices, :]
-        else:
-             # Assume no padding in incremental decoding steps
-             e_t = outputs.hidden_states[0][:, -1, :]
-             last_hidden = outputs.hidden_states[-1][:, -1, :]
+        # Left padding guarantees the last real token is at index -1 for every
+        # row, both for the first (padded) forward pass and incremental steps.
+        e_t = outputs.hidden_states[0][:, -1, :]
+        last_hidden = outputs.hidden_states[-1][:, -1, :]
 
         h_t = last_hidden.detach().clone()
 
@@ -395,12 +390,8 @@ class ModelWrapper:
         )
         past = outputs.past_key_values
         
-        if past_key_values is None:
-             last_token_indices = attention_mask.sum(1) - 1
-             batch_indices = torch.arange(input_ids.shape[0], device=input_ids.device)
-             last_hidden = outputs.hidden_states[-1][batch_indices, last_token_indices, :]
-        else:
-             last_hidden = outputs.hidden_states[-1][:, -1, :]
+        # Left padding: last real token is at index -1 for every row.
+        last_hidden = outputs.hidden_states[-1][:, -1, :]
         
         curr_output_embedding = [] 
         curr_output_embedding.append(outputs.hidden_states[0])  # input embedding

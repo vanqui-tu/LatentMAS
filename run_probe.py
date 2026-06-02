@@ -40,7 +40,7 @@ import json
 import os
 import time
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -303,7 +303,10 @@ def run_condition_batch(
     latent_forward_passes = 0
 
     # --- Latent agents (planner / critic / refiner) -----------------------
-    if cond.latent_source != "none" and cond.latent_steps >= 0:
+    # m==0 (or source "none") means no latent collaboration: skip the agents
+    # entirely so the judger runs on the target question alone. This keeps the
+    # m=0 control clean and reports latent_forward_passes=0 honestly.
+    if cond.latent_source != "none" and cond.latent_steps > 0:
         for agent in agents:
             if agent.role == "judger":
                 continue
