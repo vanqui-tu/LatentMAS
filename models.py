@@ -39,9 +39,6 @@ class ModelWrapper:
         self._latent_realign_matrices: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
         self.args = args
 
-        # for ablation
-        self.pre_aligned = None
-
         if self.use_vllm:
             
             tp_size = max(1, int(getattr(args, "tensor_parallel_size", 1)))
@@ -209,8 +206,6 @@ class ModelWrapper:
         aligned = torch.matmul(hidden_fp32, matrix)
 
         aligned_norm = aligned.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-        pre_aligned = aligned.detach().clone()
-        self.pre_aligned = pre_aligned
         aligned = aligned * (target_norm / aligned_norm)
         return aligned.to(hidden.dtype)
 
@@ -260,6 +255,8 @@ class ModelWrapper:
             cache_position=cache_position,
         )
         sequences = outputs.sequences
+        generated_past = outputs.past_key_values
+        del outputs  # free large intermediate state early
         generations: List[str] = []
         # With left padding, every row's prompt occupies the same number of
         # leading columns, so generated tokens start at input_ids.shape[1].
@@ -268,7 +265,7 @@ class ModelWrapper:
             generated_ids = sequences[idx, prompt_width:]
             text = self.tokenizer.decode(generated_ids, skip_special_tokens=skip_special_tokens).strip()
             generations.append(text)
-        return generations, outputs.past_key_values
+        return generations, generated_past
 
     def tokenize_text(self, text: str) -> torch.Tensor:
         return self.tokenizer(
@@ -316,25 +313,13 @@ class ModelWrapper:
 
         # Left padding guarantees the last real token is at index -1 for every
         # row, both for the first (padded) forward pass and incremental steps.
-        e_t = outputs.hidden_states[0][:, -1, :]
         last_hidden = outputs.hidden_states[-1][:, -1, :]
-
-        h_t = last_hidden.detach().clone()
-
-        e_t_plus_1 = None
-        latent_vecs_all: List[torch.Tensor] = []
-        latent_vecs_all.append(e_t.detach().clone())
 
         for step in range(latent_steps):
 
             source_model = self.HF_model if hasattr(self, "HF_model") else self.model
             latent_vec = self._apply_latent_realignment(last_hidden, source_model)
 
-            latent_vecs_all.append(latent_vec.detach().clone())
-
-            if step == 0:
-                e_t_plus_1 = latent_vec.detach().clone()
-            
             latent_embed = latent_vec.unsqueeze(1)
 
             past_len = _past_length(past)

@@ -198,6 +198,10 @@ class LatentMASMethod:
                         }
                     )
 
+        # Free KV-cache and force CUDA memory release between batches
+        del past_kv
+        torch.cuda.empty_cache()
+
         results: List[Dict] = []
         for idx, item in enumerate(items):
             final_text = final_texts[idx]
@@ -417,6 +421,10 @@ class LatentMASMethod:
                         }
                     )
 
+        # Free KV-cache, embeddings and force CUDA memory release between batches
+        del past_kv
+        del embedding_record
+        torch.cuda.empty_cache()
 
         results: List[Dict] = []
         for idx, item in enumerate(items):
