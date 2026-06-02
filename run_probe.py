@@ -536,7 +536,8 @@ def main():
 
     if args.output_dir is None:
         model_short = args.model_name.replace("/", "_")
-        args.output_dir = os.path.join("probe_outputs", model_short)
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        args.output_dir = os.path.join("probe_outputs", model_short, timestamp)
     os.makedirs(args.output_dir, exist_ok=True)
 
     print(f"Loading {args.model_name} on {device} (realign={args.latent_space_realign}) ...")
