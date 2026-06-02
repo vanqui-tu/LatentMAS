@@ -222,6 +222,7 @@ class ModelWrapper:
         temperature: float = 0.7,
         top_p: float = 0.95,
         past_key_values: Optional[Tuple] = None,
+        skip_special_tokens: bool = True,
     ) -> Tuple[List[str], Optional[Tuple]]:
         if input_ids.dim() != 2:
             raise ValueError("input_ids must be 2D with shape [batch, seq_len]")
@@ -262,7 +263,7 @@ class ModelWrapper:
         for idx, length in enumerate(prompt_lengths):
             length = int(length)
             generated_ids = sequences[idx, length:]
-            text = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+            text = self.tokenizer.decode(generated_ids, skip_special_tokens=skip_special_tokens).strip()
             generations.append(text)
         return generations, outputs.past_key_values
 

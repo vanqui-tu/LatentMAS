@@ -1,0 +1,5 @@
+/.kiro
+/.vscode
+/logs
+
+*.code-workspace
