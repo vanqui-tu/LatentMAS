@@ -586,6 +586,18 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     print(f"Loading {args.model_name} on {device} (realign={args.latent_space_realign}) ...")
+
+    # Save the exact command and args for reproducibility
+    import sys
+    meta = {
+        "command": " ".join(sys.argv),
+        "args": vars(args),
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    meta_path = os.path.join(args.output_dir, "run_meta.json")
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
     model = ModelWrapper(args.model_name, device, use_vllm=False, args=args)
     print("Model loaded.\n")
 
