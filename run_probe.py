@@ -8,7 +8,10 @@ generation primitives and adds experiment hooks.
 
 Key controllable axes (each can be swept independently):
   - latent_steps (m)             : --latent_steps 0 10 20 40 80   (sweepable list)
-  - judger thinking mode (T)     : --judger_thinking {on,off}
+  - judger reasoning mode (T/1C) : --judger_mode {think,nothink,direct}
+        think   : enable_thinking=True + CoT prompt (paper default)
+        nothink : enable_thinking=False, but CoT prompt still elicits reasoning
+        direct  : no CoT, answer immediately -> forces latent KV to carry reasoning (1C)
   - agent thinking mode          : --agent_thinking {on,off}
   - judger answer budget         : --judger_max_new_tokens N   (separate from agents)
   - KV isolation                 : --kv_mode {full,sequential_info_only,latent_only}
@@ -28,7 +31,7 @@ Metrics logged per (task, condition):
 Usage examples:
   # Trục T x m sweep on the decisive experiment:
   python run_probe.py --model_name Qwen/Qwen3-4B --tasks gsm8k arc_easy \
-      --max_samples 100 --latent_steps 0 10 20 40 --judger_thinking off on
+      --max_samples 100 --latent_steps 0 10 20 40 --judger_mode think direct
 
   # Cross-question transplant:
   python run_probe.py --model_name Qwen/Qwen3-4B --tasks gsm8k \
@@ -209,6 +212,42 @@ def build_messages(model_name: str, prompt_arch: str, role: str, question: str, 
         )
 
 
+# Direct-answer judger prompt for the 1C experiment: forbids chain-of-thought so
+# that any reasoning must be carried by the accumulated latent KV, not by the
+# judger's own token-space deliberation.
+def build_judger_direct_messages(task: str, question: str):
+    system_message = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
+    if task in ["gsm8k", "aime2024", "aime2025"]:
+        fmt = ("Output ONLY the final answer inside \\boxed{YOUR_FINAL_ANSWER}. "
+               "Do NOT explain. Do NOT show any reasoning or steps.")
+    elif task in ["arc_easy", "arc_challenge", "gpqa", "medqa"]:
+        fmt = ("Output ONLY the final answer letter inside \\boxed{} (A, B, C, or D). "
+               "Do NOT explain. Do NOT show any reasoning or steps.")
+    elif task in ["mbppplus", "humanevalplus"]:
+        fmt = ("Output ONLY a self-contained Python function in a single ```python code block. "
+               "Do NOT explain. Do NOT show any reasoning.")
+    elif task in ["winogrande"]:
+        fmt = ("Output ONLY the final answer inside \\boxed{} (1 or 2). "
+               "Do NOT explain. Do NOT show any reasoning or steps.")
+    else:
+        fmt = "Output ONLY the final answer. Do NOT explain."
+    user_prompt = (
+        f"Target Question: {question}\n\n"
+        f"You are provided with latent information for reference. "
+        f"Ignore it if it is not helpful.\n{fmt}\n"
+    )
+    return [
+        {"role": "system", "content": system_message},
+        {"role": "user", "content": user_prompt},
+    ]
+
+
+def build_judger_messages(model_name: str, prompt_arch: str, question: str, task: str, judger_mode: str):
+    if judger_mode == "direct":
+        return build_judger_direct_messages(task, question)
+    return build_messages(model_name, prompt_arch, "judger", question, task)
+
+
 def tokenize_prompts(model: ModelWrapper, prompts: List[str]):
     enc = model.tokenizer(
         prompts, return_tensors="pt", padding=True, add_special_tokens=False
@@ -255,7 +294,7 @@ def truncate_past(past_kv, tokens_to_keep: int):
 @dataclass
 class Condition:
     latent_steps: int
-    judger_thinking: bool
+    judger_mode: str        # think | nothink | direct
     agent_thinking: bool
     judger_max_new_tokens: int
     kv_mode: str            # full | sequential_info_only | latent_only
@@ -266,7 +305,7 @@ class Condition:
     def tag(self) -> str:
         return (
             f"m{self.latent_steps}"
-            f"_jt{'1' if self.judger_thinking else '0'}"
+            f"_j-{self.judger_mode}"
             f"_at{'1' if self.agent_thinking else '0'}"
             f"_jb{self.judger_max_new_tokens}"
             f"_kv-{self.kv_mode}"
@@ -342,11 +381,12 @@ def run_condition_batch(
                 past_kv = truncate_past(past_kv, tokens_to_keep)
 
     # --- Judger (text decode, conditioned on accumulated KV) --------------
+    judger_enable_thinking = (cond.judger_mode == "think")
     judger_prompts = [
         render_messages(
             model,
-            build_messages(model.model_name, cond.prompt_arch, "judger", it["question"], task),
-            enable_thinking=cond.judger_thinking,
+            build_judger_messages(model.model_name, cond.prompt_arch, it["question"], task, cond.judger_mode),
+            enable_thinking=judger_enable_thinking,
         )
         for it in target_items
     ]
@@ -464,7 +504,7 @@ def run_task_condition(
         "task": task,
         "condition": cond.tag(),
         "latent_steps": cond.latent_steps,
-        "judger_thinking": cond.judger_thinking,
+        "judger_mode": cond.judger_mode,
         "agent_thinking": cond.agent_thinking,
         "judger_max_new_tokens": cond.judger_max_new_tokens,
         "kv_mode": cond.kv_mode,
@@ -502,8 +542,10 @@ def main():
     # --- swept axes (accept lists) ---
     p.add_argument("--latent_steps", type=int, nargs="+", default=[40],
                    help="List of m values to sweep, e.g. 0 10 20 40 80.")
-    p.add_argument("--judger_thinking", nargs="+", choices=["on", "off"], default=["on"],
-                   help="Judger thinking mode(s) to sweep (trục T).")
+    p.add_argument("--judger_mode", nargs="+", choices=["think", "nothink", "direct"],
+                   default=["think"],
+                   help="Judger reasoning mode(s) to sweep (trục T / experiment 1C). "
+                        "think=CoT+<think>; nothink=CoT only; direct=no CoT, answer immediately.")
     p.add_argument("--agent_thinking", choices=["on", "off"], default="off",
                    help="Latent agents' thinking mode (paper default: not manually opened).")
     p.add_argument("--kv_mode", nargs="+",
@@ -547,7 +589,7 @@ def main():
     model = ModelWrapper(args.model_name, device, use_vllm=False, args=args)
     print("Model loaded.\n")
 
-    jt_list = [t == "on" for t in args.judger_thinking]
+    jt_list = list(args.judger_mode)
     agent_thinking = args.agent_thinking == "on"
 
     all_summaries: List[Dict] = []
@@ -563,7 +605,7 @@ def main():
                     for src in args.latent_source:
                         cond = Condition(
                             latent_steps=m,
-                            judger_thinking=jt,
+                            judger_mode=jt,
                             agent_thinking=agent_thinking,
                             judger_max_new_tokens=judger_budget,
                             kv_mode=kv_mode,
