@@ -163,6 +163,19 @@ def build_encoder_prompt_question_answer(question: str) -> List[Dict]:
     ]
 
 
+def build_encoder_prompt_latent_decode(question: str) -> List[Dict]:
+    """Encoder receives a question and reasons about it (same as question_answer).
+    The decoder will try to verbalize/interpret what the encoder was thinking."""
+    return [
+        {"role": "system", "content": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."},
+        {"role": "user", "content": (
+            f"Read the following question carefully and reason step by step to solve it.\n\n"
+            f"Question: {question}\n\n"
+            f"Think through the solution step by step."
+        )},
+    ]
+
+
 def build_encoder_prompt_reasoning_error(question: str, wrong_solution: str) -> List[Dict]:
     """Encoder sees a question with a wrong solution baked in."""
     return [
@@ -249,6 +262,25 @@ def build_decoder_prompt_reasoning_error() -> List[Dict]:
             "2. What error(s) the student made\n"
             "3. What the correct answer should be\n\n"
             "Output your analysis clearly."
+        )},
+    ]
+
+
+def build_decoder_prompt_latent_decode() -> List[Dict]:
+    """Decoder must verbalize/interpret what the encoder was thinking in latent space."""
+    return [
+        {"role": "system", "content": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."},
+        {"role": "user", "content": (
+            "You have been provided with latent information from a previous agent. "
+            "That agent was given a question and was reasoning about how to solve it.\n\n"
+            "Your task: describe IN DETAIL what the previous agent was thinking about. "
+            "Specifically:\n"
+            "1. What question or problem was the agent working on?\n"
+            "2. What approach or steps was the agent considering?\n"
+            "3. What intermediate conclusions or calculations did the agent reach?\n"
+            "4. What final answer (if any) did the agent arrive at?\n\n"
+            "Be as specific as possible. Describe the content of the agent's reasoning, "
+            "not just that it was reasoning."
         )},
     ]
 
@@ -417,6 +449,9 @@ def run_preservation_batch(
         elif cond.probe_task == "question_answer":
             msgs = build_encoder_prompt_question_answer(item["question"])
             references.append(item.get("gold", ""))
+        elif cond.probe_task == "latent_decode":
+            msgs = build_encoder_prompt_latent_decode(item["question"])
+            references.append(item["question"])  # reference is the question itself
         elif cond.probe_task == "reasoning_error":
             # Generate a plausible wrong answer for the encoder
             wrong = item.get("_wrong_solution", f"The answer is 999.")
@@ -488,6 +523,8 @@ def run_preservation_batch(
         decoder_msgs = build_decoder_prompt_secret_string()
     elif cond.probe_task == "question_answer":
         decoder_msgs = build_decoder_prompt_question_answer(task)
+    elif cond.probe_task == "latent_decode":
+        decoder_msgs = build_decoder_prompt_latent_decode()
     elif cond.probe_task == "reasoning_error":
         decoder_msgs = build_decoder_prompt_reasoning_error()
     else:
@@ -529,6 +566,11 @@ def run_preservation_batch(
 
         if cond.probe_task in ("question_recall", "secret_key", "secret_string"):
             metrics = evaluate_recall(raw_output_eval, ref)
+        elif cond.probe_task == "latent_decode":
+            # For latent decode, measure how much of the original question content
+            # the decoder recovered, plus save full output for qualitative analysis
+            metrics = evaluate_recall(raw_output_eval, ref)
+            metrics["raw_decode_full"] = raw_output[:2000]  # save more for manual inspection
         elif cond.probe_task == "question_answer":
             pred = normalize_answer(extract_gsm8k_answer(raw_output))
             gold = ref
@@ -594,7 +636,7 @@ def run_condition(
     n = len(all_results)
 
     # Aggregate metrics
-    if cond.probe_task in ("question_recall", "secret_key", "secret_string"):
+    if cond.probe_task in ("question_recall", "secret_key", "secret_string", "latent_decode"):
         em_count = sum(1 for r in all_results if r.get("exact_match", False))
         avg_f1 = sum(r.get("token_f1", 0.0) for r in all_results) / n if n else 0.0
         avg_lcs = sum(r.get("lcs_ratio", 0.0) for r in all_results) / n if n else 0.0
@@ -663,7 +705,7 @@ def main():
 
     # Swept axes
     p.add_argument("--probe_task", nargs="+",
-                   choices=["question_recall", "secret_key", "secret_string", "question_answer", "reasoning_error"],
+                   choices=["question_recall", "secret_key", "secret_string", "question_answer", "latent_decode", "reasoning_error"],
                    default=["question_recall", "secret_key", "secret_string"])
     p.add_argument("--latent_steps", type=int, nargs="+", default=[0, 10, 20, 40, 80])
     p.add_argument("--kv_pass_mode", nargs="+",
@@ -760,7 +802,7 @@ def main():
 
                     # Print headline
                     headline_parts = [f"[{args.task}] {cond.tag()}"]
-                    if probe_task in ("question_recall", "secret_key", "secret_string"):
+                    if probe_task in ("question_recall", "secret_key", "secret_string", "latent_decode"):
                         headline_parts.append(
                             f"EM={s['exact_match_rate']:.3f} F1={s['avg_token_f1']:.3f} "
                             f"Recall={s['avg_token_recall']:.3f} LCS={s['avg_lcs_ratio']:.3f}"
@@ -791,7 +833,7 @@ def main():
     print("=" * 80)
     for s in all_summaries:
         line = f"{s['condition']:60s}"
-        if s["probe_task"] in ("question_recall", "secret_key", "secret_string"):
+        if s["probe_task"] in ("question_recall", "secret_key", "secret_string", "latent_decode"):
             line += f" EM={s['exact_match_rate']:.3f} F1={s['avg_token_f1']:.3f} LCS={s['avg_lcs_ratio']:.3f}"
         elif s["probe_task"] == "question_answer":
             line += f" Acc={s['accuracy']:.4f}"
