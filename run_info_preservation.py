@@ -213,6 +213,21 @@ def build_encoder_prompt_latent_decode(question: str) -> List[Dict]:
     ]
 
 
+def build_encoder_prompt_latent_cot(question: str) -> List[Dict]:
+    """Encoder solves the problem in latent space. Prompt ends at a cue so the latent
+    steps continue the actual working-out (the CoT) rather than drifting. The decoder
+    will be forbidden from reasoning and must only read off the answer."""
+    return [
+        {"role": "system", "content": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."},
+        {"role": "user", "content": (
+            f"Solve the following problem. Work through every calculation carefully and "
+            f"arrive at a single definite final answer.\n\n"
+            f"Question: {question}\n\n"
+            f"Let me work through this step by step:"
+        )},
+    ]
+
+
 def build_encoder_prompt_reasoning_error(question: str, wrong_solution: str) -> List[Dict]:
     """Encoder sees a question with a wrong solution baked in."""
     return [
@@ -299,6 +314,29 @@ def build_decoder_prompt_reasoning_error() -> List[Dict]:
             "2. What error(s) the student made\n"
             "3. What the correct answer should be\n\n"
             "Output your analysis clearly."
+        )},
+    ]
+
+
+def build_decoder_prompt_latent_cot(task: str) -> List[Dict]:
+    """Decoder is a pure judge: a previous agent has ALREADY solved the problem in latent
+    space. The decoder must NOT reason — it only reads off the answer the agent reached.
+    Use with --decoder_thinking off so no token-space CoT budget is available."""
+    if task in ["gsm8k"]:
+        fmt = "Output ONLY the final numeric answer inside \\boxed{}. Nothing else."
+    elif task in ["arc_challenge", "arc_easy"]:
+        fmt = "Output ONLY the final answer letter (A, B, C, or D) inside \\boxed{}. Nothing else."
+    else:
+        fmt = "Output ONLY the final answer inside \\boxed{}. Nothing else."
+    return [
+        {"role": "system", "content": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."},
+        {"role": "user", "content": (
+            "A previous agent has ALREADY fully solved a problem and reached a definite answer. "
+            "Its complete reasoning is available to you as latent information.\n\n"
+            "Your ONLY job is to read off the final answer the previous agent arrived at. "
+            "Do NOT solve the problem yourself. Do NOT add any new reasoning or calculations. "
+            "Simply report the answer that the previous agent's reasoning concluded with.\n\n"
+            f"{fmt}"
         )},
     ]
 
@@ -498,6 +536,9 @@ def run_preservation_batch(
         elif cond.probe_task == "question_answer":
             msgs = build_encoder_prompt_question_answer(item["question"])
             references.append(item.get("gold", ""))
+        elif cond.probe_task == "latent_cot":
+            msgs = build_encoder_prompt_latent_cot(item["question"])
+            references.append(item.get("gold", ""))
         elif cond.probe_task == "latent_decode":
             msgs = build_encoder_prompt_latent_decode(item["question"])
             references.append(item["question"])  # reference is the question itself
@@ -572,6 +613,8 @@ def run_preservation_batch(
         decoder_msgs = build_decoder_prompt_secret_string()
     elif cond.probe_task == "question_answer":
         decoder_msgs = build_decoder_prompt_question_answer(task)
+    elif cond.probe_task == "latent_cot":
+        decoder_msgs = build_decoder_prompt_latent_cot(task)
     elif cond.probe_task == "latent_decode":
         decoder_msgs = build_decoder_prompt_latent_decode()
     elif cond.probe_task == "reasoning_error":
@@ -620,7 +663,7 @@ def run_preservation_batch(
             # the decoder recovered, plus save full output for qualitative analysis
             metrics = evaluate_recall(raw_output_eval, ref)
             metrics["raw_decode_full"] = raw_output[:2000]  # save more for manual inspection
-        elif cond.probe_task == "question_answer":
+        elif cond.probe_task in ("question_answer", "latent_cot"):
             pred = normalize_answer(extract_gsm8k_answer(raw_output))
             gold = ref
             metrics = {
@@ -696,7 +739,7 @@ def run_condition(
             "avg_token_recall": round(avg_recall, 4),
             "avg_lcs_ratio": round(avg_lcs, 4),
         }
-    elif cond.probe_task == "question_answer":
+    elif cond.probe_task in ("question_answer", "latent_cot"):
         correct = sum(1 for r in all_results if r.get("exact_match", False))
         summary = {"accuracy": round(correct / n, 4) if n else 0.0, "correct": correct}
     elif cond.probe_task == "reasoning_error":
@@ -754,7 +797,7 @@ def main():
 
     # Swept axes
     p.add_argument("--probe_task", nargs="+",
-                   choices=["question_recall", "secret_key", "secret_string", "question_answer", "latent_decode", "reasoning_error"],
+                   choices=["question_recall", "secret_key", "secret_string", "question_answer", "latent_cot", "latent_decode", "reasoning_error"],
                    default=["question_recall", "secret_key", "secret_string"])
     p.add_argument("--latent_steps", type=int, nargs="+", default=[0, 10, 20, 40, 80])
     p.add_argument("--kv_pass_mode", nargs="+",
@@ -861,7 +904,7 @@ def main():
                             f"EM={s['exact_match_rate']:.3f} F1={s['avg_token_f1']:.3f} "
                             f"Recall={s['avg_token_recall']:.3f} LCS={s['avg_lcs_ratio']:.3f}"
                         )
-                    elif probe_task == "question_answer":
+                    elif probe_task in ("question_answer", "latent_cot"):
                         headline_parts.append(f"Acc={s['accuracy']:.4f}")
                     elif probe_task == "reasoning_error":
                         headline_parts.append(f"ErrDet={s['error_detection_rate']:.4f}")
@@ -889,7 +932,7 @@ def main():
         line = f"{s['condition']:60s}"
         if s["probe_task"] in ("question_recall", "secret_key", "secret_string", "latent_decode"):
             line += f" EM={s['exact_match_rate']:.3f} F1={s['avg_token_f1']:.3f} LCS={s['avg_lcs_ratio']:.3f}"
-        elif s["probe_task"] == "question_answer":
+        elif s["probe_task"] in ("question_answer", "latent_cot"):
             line += f" Acc={s['accuracy']:.4f}"
         elif s["probe_task"] == "reasoning_error":
             line += f" ErrDet={s['error_detection_rate']:.4f}"
