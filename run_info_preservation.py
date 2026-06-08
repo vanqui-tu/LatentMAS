@@ -139,6 +139,19 @@ def build_encoder_prompt_secret_key(secret: str) -> List[Dict]:
     ]
 
 
+def build_encoder_prompt_secret_key_rehearse(secret: str) -> List[Dict]:
+    """Rehearse variant: the prompt ends right where the natural continuation IS the key,
+    so the latent steps (next-token continuations) are steered to re-encode it."""
+    return [
+        {"role": "system", "content": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."},
+        {"role": "user", "content": (
+            f"Memorize this secret key, then rehearse it silently.\n\n"
+            f"SECRET KEY: {secret}\n\n"
+            f"I will now repeat the secret key from memory. The secret key is:"
+        )},
+    ]
+
+
 def build_encoder_prompt_secret_string(secret: str) -> List[Dict]:
     """Encoder agent receives a random word sequence and is told to memorize it."""
     return [
@@ -147,6 +160,30 @@ def build_encoder_prompt_secret_string(secret: str) -> List[Dict]:
             f"IMPORTANT: Memorize the following secret phrase exactly. You will need to recall it later.\n\n"
             f"SECRET PHRASE: {secret}\n\n"
             f"Think carefully about this phrase and commit every word to memory in order."
+        )},
+    ]
+
+
+def build_encoder_prompt_secret_string_rehearse(secret: str) -> List[Dict]:
+    """Rehearse variant for secret_string: prompt ends where the continuation is the phrase."""
+    return [
+        {"role": "system", "content": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."},
+        {"role": "user", "content": (
+            f"Memorize this secret phrase, then rehearse it silently.\n\n"
+            f"SECRET PHRASE: {secret}\n\n"
+            f"I will now repeat the secret phrase from memory. The secret phrase is:"
+        )},
+    ]
+
+
+def build_encoder_prompt_question_recall_rehearse(question: str) -> List[Dict]:
+    """Rehearse variant for question_recall: prompt ends where the continuation is the question."""
+    return [
+        {"role": "system", "content": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."},
+        {"role": "user", "content": (
+            f"Read and memorize the following question, then rehearse it silently.\n\n"
+            f"Question: {question}\n\n"
+            f"I will now repeat the question word for word from memory. The question is:"
         )},
     ]
 
@@ -384,6 +421,7 @@ class Condition:
     secret_word_count: int   # only for secret_string task
     decoder_thinking: bool   # whether decoder gets <think> mode
     realign: bool
+    encoder_rehearse: bool = False  # steer latent continuation toward recall (prompt ends at recall cue)
 
     def tag(self) -> str:
         parts = [
@@ -397,6 +435,8 @@ class Condition:
             parts.append(f"sw{self.secret_word_count}")
         parts.append(f"dec-{'think' if self.decoder_thinking else 'direct'}")
         parts.append(f"ra{'1' if self.realign else '0'}")
+        if self.encoder_rehearse:
+            parts.append("reh1")
         return "_".join(parts)
 
 
@@ -434,16 +474,25 @@ def run_preservation_batch(
 
     for item in items:
         if cond.probe_task == "question_recall":
-            msgs = build_encoder_prompt_question_recall(item["question"])
+            if cond.encoder_rehearse:
+                msgs = build_encoder_prompt_question_recall_rehearse(item["question"])
+            else:
+                msgs = build_encoder_prompt_question_recall(item["question"])
             references.append(item["question"])
         elif cond.probe_task == "secret_key":
             secret = generate_secret_key(rng, cond.secret_key_length)
-            msgs = build_encoder_prompt_secret_key(secret)
+            if cond.encoder_rehearse:
+                msgs = build_encoder_prompt_secret_key_rehearse(secret)
+            else:
+                msgs = build_encoder_prompt_secret_key(secret)
             references.append(secret)
             item["_secret"] = secret  # stash for logging
         elif cond.probe_task == "secret_string":
             secret = generate_secret_string(rng, cond.secret_word_count)
-            msgs = build_encoder_prompt_secret_string(secret)
+            if cond.encoder_rehearse:
+                msgs = build_encoder_prompt_secret_string_rehearse(secret)
+            else:
+                msgs = build_encoder_prompt_secret_string(secret)
             references.append(secret)
             item["_secret"] = secret
         elif cond.probe_task == "question_answer":
@@ -717,6 +766,10 @@ def main():
                    help="Number of random words in secret phrase (only for secret_string probe)")
     p.add_argument("--decoder_thinking", choices=["on", "off"], default="on",
                    help="Whether decoder agent gets thinking mode (CoT)")
+    p.add_argument("--encoder_rehearse", action="store_true",
+                   help="Steer latent continuation toward recall: encoder prompt ends at a "
+                        "recall cue ('the secret key is:') so latent steps re-encode the target "
+                        "instead of drifting. Tests whether latent must be explicitly directed.")
 
     # Fixed knobs
     p.add_argument("--latent_space_realign", action="store_true")
@@ -790,6 +843,7 @@ def main():
                         secret_word_count=length_val if probe_task == "secret_string" else 5,
                         decoder_thinking=decoder_thinking,
                         realign=args.latent_space_realign,
+                        encoder_rehearse=args.encoder_rehearse,
                     )
 
                     out = run_condition(
