@@ -112,6 +112,59 @@ def generate_secret_string(rng: random.Random, num_words: int = 5) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Synthetic data for latent_transform probe
+# ---------------------------------------------------------------------------
+
+def _generate_transform_items(rng: random.Random, n: int) -> List[Dict]:
+    """Generate synthetic items for the latent_transform probe.
+    Each item has: original value, transformation instruction, expected result."""
+    transforms = []
+    for _ in range(n):
+        kind = rng.choice(["number_double", "number_add", "word_reverse", "word_first_letter"])
+
+        if kind == "number_double":
+            num = rng.randint(10, 999)
+            transforms.append({
+                "question": "",  # dummy, not used
+                "original": str(num),
+                "instruction": f"Now double this number.",
+                "expected_result": str(num * 2),
+                "transform_kind": kind,
+            })
+        elif kind == "number_add":
+            a = rng.randint(10, 500)
+            b = rng.randint(10, 500)
+            transforms.append({
+                "question": "",
+                "original": str(a),
+                "instruction": f"Now add {b} to this number.",
+                "expected_result": str(a + b),
+                "transform_kind": kind,
+            })
+        elif kind == "word_reverse":
+            words = [rng.choice(_WORD_POOL) for _ in range(3)]
+            phrase = ' '.join(words)
+            transforms.append({
+                "question": "",
+                "original": phrase,
+                "instruction": "Now reverse the order of these words.",
+                "expected_result": ' '.join(reversed(words)),
+                "transform_kind": kind,
+            })
+        elif kind == "word_first_letter":
+            words = [rng.choice(_WORD_POOL) for _ in range(4)]
+            phrase = ' '.join(words)
+            transforms.append({
+                "question": "",
+                "original": phrase,
+                "instruction": "Now take the first letter of each word and concatenate them.",
+                "expected_result": ''.join(w[0] for w in words),
+                "transform_kind": kind,
+            })
+    return transforms
+
+
+# ---------------------------------------------------------------------------
 # Prompt builders for the 2-agent setup
 # ---------------------------------------------------------------------------
 
@@ -184,6 +237,19 @@ def build_encoder_prompt_question_recall_rehearse(question: str) -> List[Dict]:
             f"Read and memorize the following question, then rehearse it silently.\n\n"
             f"Question: {question}\n\n"
             f"I will now repeat the question word for word from memory. The question is:"
+        )},
+    ]
+
+
+def build_encoder_prompt_latent_transform(original: str, instruction: str) -> List[Dict]:
+    """Encoder receives a value and a transformation instruction. The prompt ends at
+    a cue so the latent continuation executes the transform mentally."""
+    return [
+        {"role": "system", "content": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."},
+        {"role": "user", "content": (
+            f"Here is a value: {original}\n\n"
+            f"{instruction}\n\n"
+            f"I will now compute the result step by step. The answer is:"
         )},
     ]
 
@@ -337,6 +403,21 @@ def build_decoder_prompt_latent_cot(task: str) -> List[Dict]:
             "Do NOT solve the problem yourself. Do NOT add any new reasoning or calculations. "
             "Simply report the answer that the previous agent's reasoning concluded with.\n\n"
             f"{fmt}"
+        )},
+    ]
+
+
+def build_decoder_prompt_latent_transform() -> List[Dict]:
+    """Decoder must output what the previous agent was thinking about — the result it
+    computed. Intentionally vague so we can see whether the decoder outputs the original
+    value or the transformed value."""
+    return [
+        {"role": "system", "content": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."},
+        {"role": "user", "content": (
+            "A previous agent was processing some information and arrived at a result. "
+            "Its thinking is available to you as latent information.\n\n"
+            "Your task: output ONLY the final result that the previous agent computed. "
+            "Nothing else — no explanation, no reasoning, just the result value."
         )},
     ]
 
@@ -539,6 +620,12 @@ def run_preservation_batch(
         elif cond.probe_task == "latent_cot":
             msgs = build_encoder_prompt_latent_cot(item["question"])
             references.append(item.get("gold", ""))
+        elif cond.probe_task == "latent_transform":
+            msgs = build_encoder_prompt_latent_transform(item["original"], item["instruction"])
+            # reference is the expected transformed result
+            references.append(item["expected_result"])
+            # also stash original for analysis
+            item["_original_value"] = item["original"]
         elif cond.probe_task == "latent_decode":
             msgs = build_encoder_prompt_latent_decode(item["question"])
             references.append(item["question"])  # reference is the question itself
@@ -615,6 +702,8 @@ def run_preservation_batch(
         decoder_msgs = build_decoder_prompt_question_answer(task)
     elif cond.probe_task == "latent_cot":
         decoder_msgs = build_decoder_prompt_latent_cot(task)
+    elif cond.probe_task == "latent_transform":
+        decoder_msgs = build_decoder_prompt_latent_transform()
     elif cond.probe_task == "latent_decode":
         decoder_msgs = build_decoder_prompt_latent_decode()
     elif cond.probe_task == "reasoning_error":
@@ -669,6 +758,21 @@ def run_preservation_batch(
             metrics = {
                 "exact_match": (pred == gold) if (pred and gold) else False,
                 "prediction": pred,
+            }
+        elif cond.probe_task == "latent_transform":
+            # Check if output matches transformed result, original, or neither
+            output_clean = raw_output_eval.strip().lower()
+            expected = ref.strip().lower()
+            original = items[idx].get("_original_value", "").strip().lower()
+            matches_transformed = expected in output_clean
+            matches_original = original in output_clean and original != expected
+            metrics = {
+                "matches_transformed": matches_transformed,
+                "matches_original": matches_original,
+                "matches_neither": not matches_transformed and not matches_original,
+                "expected_result": ref,
+                "original_value": items[idx].get("_original_value", ""),
+                "transform_kind": items[idx].get("transform_kind", ""),
             }
         elif cond.probe_task == "reasoning_error":
             # For error detection, check if gold answer appears in output
@@ -742,6 +846,18 @@ def run_condition(
     elif cond.probe_task in ("question_answer", "latent_cot"):
         correct = sum(1 for r in all_results if r.get("exact_match", False))
         summary = {"accuracy": round(correct / n, 4) if n else 0.0, "correct": correct}
+    elif cond.probe_task == "latent_transform":
+        n_transformed = sum(1 for r in all_results if r.get("matches_transformed", False))
+        n_original = sum(1 for r in all_results if r.get("matches_original", False))
+        n_neither = sum(1 for r in all_results if r.get("matches_neither", False))
+        summary = {
+            "rate_transformed": round(n_transformed / n, 4) if n else 0.0,
+            "rate_original": round(n_original / n, 4) if n else 0.0,
+            "rate_neither": round(n_neither / n, 4) if n else 0.0,
+            "n_transformed": n_transformed,
+            "n_original": n_original,
+            "n_neither": n_neither,
+        }
     elif cond.probe_task == "reasoning_error":
         correct = sum(1 for r in all_results if r.get("correct_answer_found", False))
         summary = {"error_detection_rate": round(correct / n, 4) if n else 0.0, "correct": correct}
@@ -797,7 +913,7 @@ def main():
 
     # Swept axes
     p.add_argument("--probe_task", nargs="+",
-                   choices=["question_recall", "secret_key", "secret_string", "question_answer", "latent_cot", "latent_decode", "reasoning_error"],
+                   choices=["question_recall", "secret_key", "secret_string", "question_answer", "latent_cot", "latent_transform", "latent_decode", "reasoning_error"],
                    default=["question_recall", "secret_key", "secret_string"])
     p.add_argument("--latent_steps", type=int, nargs="+", default=[0, 10, 20, 40, 80])
     p.add_argument("--kv_pass_mode", nargs="+",
@@ -859,10 +975,16 @@ def main():
     dataset = load_dataset_for_probe(args.task, args.max_samples)
     print(f"Dataset: {args.task}, {len(dataset)} samples\n")
 
+    # Synthetic dataset for latent_transform (generated once, reused across conditions)
+    transform_dataset = _generate_transform_items(rng, args.max_samples)
+
     decoder_thinking = (args.decoder_thinking == "on")
     all_summaries: List[Dict] = []
 
     for probe_task in args.probe_task:
+        # Select dataset: latent_transform uses synthetic data, others use task dataset
+        active_dataset = transform_dataset if probe_task == "latent_transform" else dataset
+
         # For secret_key, sweep key lengths; for secret_string, sweep word counts
         if probe_task == "secret_key":
             length_sweep = args.secret_key_length
@@ -890,7 +1012,7 @@ def main():
                     )
 
                     out = run_condition(
-                        model, args.task, dataset, cond,
+                        model, args.task, active_dataset, cond,
                         args.generate_bs, args.temperature, args.top_p,
                         rng, args.max_new_tokens,
                     )
@@ -906,6 +1028,12 @@ def main():
                         )
                     elif probe_task in ("question_answer", "latent_cot"):
                         headline_parts.append(f"Acc={s['accuracy']:.4f}")
+                    elif probe_task == "latent_transform":
+                        headline_parts.append(
+                            f"Transformed={s['rate_transformed']:.3f} "
+                            f"Original={s['rate_original']:.3f} "
+                            f"Neither={s['rate_neither']:.3f}"
+                        )
                     elif probe_task == "reasoning_error":
                         headline_parts.append(f"ErrDet={s['error_detection_rate']:.4f}")
                     headline_parts.append(f"{s['time_per_sample_sec']}s/it")
@@ -934,6 +1062,8 @@ def main():
             line += f" EM={s['exact_match_rate']:.3f} F1={s['avg_token_f1']:.3f} LCS={s['avg_lcs_ratio']:.3f}"
         elif s["probe_task"] in ("question_answer", "latent_cot"):
             line += f" Acc={s['accuracy']:.4f}"
+        elif s["probe_task"] == "latent_transform":
+            line += f" Trans={s['rate_transformed']:.3f} Orig={s['rate_original']:.3f} Neither={s['rate_neither']:.3f}"
         elif s["probe_task"] == "reasoning_error":
             line += f" ErrDet={s['error_detection_rate']:.4f}"
         print(line)
