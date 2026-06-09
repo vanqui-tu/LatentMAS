@@ -29,6 +29,13 @@ def _past_length(past_key_values: Optional[Tuple]) -> int:
     return k.shape[-2]
 
 
+def _positions_from_mask(mask: torch.Tensor, n_last: int) -> torch.Tensor:
+    """Position ids for the last `n_last` columns of `mask`, counting only real
+    (non-pad) tokens so padding columns don't consume RoPE positions (keeps bs>1 == bs=1)."""
+    pos = (mask.long().cumsum(-1) - 1).clamp(min=0)
+    return pos[:, -n_last:]
+
+
 class ModelWrapper:
     def __init__(self, model_name: str, device: torch.device, use_vllm: bool = False, args = None):
         self.model_name = model_name
@@ -219,6 +226,7 @@ class ModelWrapper:
         temperature: float = 0.7,
         top_p: float = 0.95,
         past_key_values: Optional[Tuple] = None,
+        past_attention_mask: Optional[torch.Tensor] = None,
         skip_special_tokens: bool = True,
     ) -> Tuple[List[str], Optional[Tuple]]:
         if input_ids.dim() != 2:
@@ -235,12 +243,21 @@ class ModelWrapper:
                 device=self.device,
             )
             if past_len > 0:
-                past_mask = torch.ones(
-                    (attention_mask.shape[0], past_len),
-                    dtype=attention_mask.dtype,
-                    device=attention_mask.device,
-                )
+                # Cached KV may hold left-padding columns; keep them masked (0)
+                # via the real past mask, else the decoder attends to padding.
+                if past_attention_mask is not None:
+                    past_mask = past_attention_mask.to(
+                        dtype=attention_mask.dtype, device=attention_mask.device
+                    )
+                else:
+                    past_mask = torch.ones(
+                        (attention_mask.shape[0], past_len),
+                        dtype=attention_mask.dtype,
+                        device=attention_mask.device,
+                    )
                 attention_mask = torch.cat([past_mask, attention_mask], dim=-1)
+        # Don't pass position_ids: generate() recomputes them from attention_mask
+        # each step; a user-supplied one would freeze generated tokens (transformers 4.57).
         outputs = self.model.generate(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -258,8 +275,7 @@ class ModelWrapper:
         generated_past = outputs.past_key_values
         del outputs  # free large intermediate state early
         generations: List[str] = []
-        # With left padding, every row's prompt occupies the same number of
-        # leading columns, so generated tokens start at input_ids.shape[1].
+        # Left padding → all rows share prompt width; generation starts there.
         prompt_width = input_ids.shape[1]
         for idx in range(sequences.shape[0]):
             generated_ids = sequences[idx, prompt_width:]
@@ -282,6 +298,8 @@ class ModelWrapper:
         *,
         latent_steps: int,
         past_key_values: Optional[Tuple] = None,
+        past_attention_mask: Optional[torch.Tensor] = None,
+        return_mask: bool = False,
     ) -> Tuple:
         if input_ids.dim() != 2:
             raise ValueError("input_ids must be 2D with shape [batch, seq_len]")
@@ -291,19 +309,28 @@ class ModelWrapper:
         else:
             attention_mask = attention_mask.to(self.device)
 
-        if past_key_values is not None:
+        # Full mask over [past KV | current prompt]; cached padding columns stay
+        # masked (0) so latent steps don't attend to them.
+        if past_key_values is not None and _past_length(past_key_values) > 0:
             past_len = _past_length(past_key_values)
-            if past_len > 0:
+            if past_attention_mask is not None:
+                past_mask = past_attention_mask.to(
+                    dtype=attention_mask.dtype, device=self.device
+                )
+            else:
                 past_mask = torch.ones(
                     (attention_mask.shape[0], past_len),
                     dtype=attention_mask.dtype,
-                    device=attention_mask.device,
+                    device=self.device,
                 )
-                attention_mask = torch.cat([past_mask, attention_mask], dim=-1)
+            full_mask = torch.cat([past_mask, attention_mask], dim=-1)
+        else:
+            full_mask = attention_mask
 
         outputs = self.model(
             input_ids=input_ids,
-            attention_mask=attention_mask,
+            attention_mask=full_mask,
+            position_ids=_positions_from_mask(full_mask, input_ids.shape[1]),
             past_key_values=past_key_values,
             use_cache=True,
             output_hidden_states=True,
@@ -311,8 +338,7 @@ class ModelWrapper:
         )
         past = outputs.past_key_values
 
-        # Left padding guarantees the last real token is at index -1 for every
-        # row, both for the first (padded) forward pass and incremental steps.
+        # Left padding → last real token is at index -1 (prefill and each step).
         last_hidden = outputs.hidden_states[-1][:, -1, :]
 
         for step in range(latent_steps):
@@ -322,15 +348,22 @@ class ModelWrapper:
 
             latent_embed = latent_vec.unsqueeze(1)
 
-            past_len = _past_length(past)
-            latent_mask = torch.ones(
-                (latent_embed.shape[0], past_len + 1),
-                dtype=torch.long,
-                device=self.device,
+            # Append one real (latent) column to the running mask.
+            full_mask = torch.cat(
+                [
+                    full_mask,
+                    torch.ones(
+                        (full_mask.shape[0], 1),
+                        dtype=full_mask.dtype,
+                        device=self.device,
+                    ),
+                ],
+                dim=-1,
             )
             outputs = self.model(
                 inputs_embeds=latent_embed,
-                attention_mask=latent_mask,
+                attention_mask=full_mask,
+                position_ids=_positions_from_mask(full_mask, 1),
                 past_key_values=past,
                 use_cache=True,
                 output_hidden_states=True,
@@ -339,6 +372,8 @@ class ModelWrapper:
             past = outputs.past_key_values
             last_hidden = outputs.hidden_states[-1][:, -1, :]
 
+        if return_mask:
+            return past, full_mask
         return past
     
     @torch.no_grad()
@@ -349,6 +384,8 @@ class ModelWrapper:
         *,
         latent_steps: int,
         past_key_values: Optional[Tuple] = None,
+        past_attention_mask: Optional[torch.Tensor] = None,
+        return_mask: bool = False,
     ) -> Tuple:
         if input_ids.dim() != 2:
             raise ValueError("input_ids must be 2D with shape [batch, seq_len]")
@@ -356,18 +393,26 @@ class ModelWrapper:
             attention_mask = torch.ones_like(input_ids, device=self.HF_device)
         else:
             attention_mask = attention_mask.to(self.HF_device)
-        if past_key_values is not None:
+        # Full mask over [past KV | current prompt]; padding columns stay masked.
+        if past_key_values is not None and _past_length(past_key_values) > 0:
             past_len = _past_length(past_key_values)
-            if past_len > 0:
+            if past_attention_mask is not None:
+                past_mask = past_attention_mask.to(
+                    dtype=attention_mask.dtype, device=attention_mask.device
+                )
+            else:
                 past_mask = torch.ones(
                     (attention_mask.shape[0], past_len),
                     dtype=attention_mask.dtype,
                     device=attention_mask.device,
                 )
-                attention_mask = torch.cat([past_mask, attention_mask], dim=-1)
+            full_mask = torch.cat([past_mask, attention_mask], dim=-1)
+        else:
+            full_mask = attention_mask
         outputs = self.HF_model(
             input_ids=input_ids,
-            attention_mask=attention_mask,
+            attention_mask=full_mask,
+            position_ids=_positions_from_mask(full_mask, input_ids.shape[1]),
             past_key_values=past_key_values,
             use_cache=True,
             output_hidden_states=True,
@@ -375,7 +420,7 @@ class ModelWrapper:
         )
         past = outputs.past_key_values
         
-        # Left padding: last real token is at index -1 for every row.
+        # Left padding → last real token is at index -1.
         last_hidden = outputs.hidden_states[-1][:, -1, :]
         
         curr_output_embedding = [] 
@@ -387,15 +432,21 @@ class ModelWrapper:
             source_model = self.HF_model if hasattr(self, "HF_model") else self.model
             latent_vec = self._apply_latent_realignment(last_hidden, source_model)
             latent_embed = latent_vec.unsqueeze(1)
-            past_len = _past_length(past)
-            latent_mask = torch.ones(
-                (latent_embed.shape[0], past_len + 1),
-                dtype=torch.long,
-                device=latent_embed.device,
+            full_mask = torch.cat(
+                [
+                    full_mask,
+                    torch.ones(
+                        (full_mask.shape[0], 1),
+                        dtype=full_mask.dtype,
+                        device=latent_embed.device,
+                    ),
+                ],
+                dim=-1,
             )
             outputs = self.HF_model(
                 inputs_embeds=latent_embed,
-                attention_mask=latent_mask,
+                attention_mask=full_mask,
+                position_ids=_positions_from_mask(full_mask, 1),
                 past_key_values=past,
                 use_cache=True,
                 output_hidden_states=True,
@@ -406,5 +457,8 @@ class ModelWrapper:
 
             curr_output_embedding.append(latent_embed.detach())
 
-        return past, torch.cat(curr_output_embedding, dim=1) # Output input embeddings
+        embeddings = torch.cat(curr_output_embedding, dim=1)  # Output input embeddings
+        if return_mask:
+            return past, embeddings, full_mask
+        return past, embeddings
 

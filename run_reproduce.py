@@ -120,6 +120,7 @@ def run_latent_mas_batch(
 
     batch_size = len(items)
     past_kv = None
+    running_mask = None
     agent_traces: List[List[Dict]] = [[] for _ in range(batch_size)]
     final_texts = [""] * batch_size
 
@@ -146,11 +147,13 @@ def run_latent_mas_batch(
         )
 
         if agent.role != "judger":
-            past_kv = model.generate_latent_batch(
+            past_kv, running_mask = model.generate_latent_batch(
                 input_ids,
                 attention_mask=attention_mask,
                 latent_steps=latent_steps,
                 past_key_values=past_kv,
+                past_attention_mask=running_mask,
+                return_mask=True,
             )
             kv_len = _past_length(past_kv)
             for idx in range(batch_size):
@@ -171,6 +174,7 @@ def run_latent_mas_batch(
                 temperature=temperature,
                 top_p=top_p,
                 past_key_values=past_for_decoding,
+                past_attention_mask=(running_mask if past_for_decoding is not None else None),
             )
             for idx in range(batch_size):
                 output_text = generated_batch[idx].strip()

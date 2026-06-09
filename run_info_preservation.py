@@ -649,11 +649,12 @@ def run_preservation_batch(
     prompt_len = enc_ids.shape[1]  # after padding, all have same length
 
     if cond.latent_steps > 0:
-        past_kv = model.generate_latent_batch(
+        past_kv, enc_full_mask = model.generate_latent_batch(
             enc_ids,
             attention_mask=enc_mask,
             latent_steps=cond.latent_steps,
             past_key_values=None,
+            return_mask=True,
         )
     else:
         # m=0: just run a forward pass to get the prompt KV
@@ -665,25 +666,35 @@ def run_preservation_batch(
             return_dict=True,
         )
         past_kv = outputs.past_key_values
+        enc_full_mask = enc_mask
         del outputs
 
     total_kv_len = _past_length(past_kv)
 
     # --- Step 3: Slice KV based on kv_pass_mode ---
+    # The encoder KV carries LEFT-PADDING columns (variable per row, depending on
+    # the longest encoder prompt in the batch). We slice the matching mask region
+    # alongside the KV so the decoder never attends to padding — this is what
+    # makes batched results equal bs=1.
     if cond.kv_pass_mode == "full":
         decoder_kv = past_kv
+        decoder_past_mask = enc_full_mask
     elif cond.kv_pass_mode == "latent_only":
         # Only the latent step entries (last m positions)
         if cond.latent_steps > 0:
             start = total_kv_len - cond.latent_steps
             decoder_kv = slice_past_kv(past_kv, start, total_kv_len)
+            decoder_past_mask = enc_full_mask[:, start:total_kv_len]
         else:
             decoder_kv = None
+            decoder_past_mask = None
     elif cond.kv_pass_mode == "prompt_only":
         # Only the original prompt KV (first prompt_len positions)
         decoder_kv = slice_past_kv(past_kv, 0, prompt_len)
+        decoder_past_mask = enc_full_mask[:, 0:prompt_len]
     elif cond.kv_pass_mode == "none":
         decoder_kv = None
+        decoder_past_mask = None
     else:
         raise ValueError(f"Unknown kv_pass_mode: {cond.kv_pass_mode}")
 
@@ -724,6 +735,7 @@ def run_preservation_batch(
         temperature=temperature,
         top_p=top_p,
         past_key_values=decoder_kv,
+        past_attention_mask=decoder_past_mask,
         skip_special_tokens=False,
     )
 

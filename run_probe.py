@@ -339,6 +339,7 @@ def run_condition_batch(
     """
     batch_size = len(target_items)
     past_kv = None
+    running_mask = None
     latent_forward_passes = 0
 
     # --- Latent agents (planner / critic / refiner) -----------------------
@@ -363,11 +364,13 @@ def run_condition_batch(
             input_ids, attn = tokenize_prompts(model, prompts)
 
             prev_len = _past_length(past_kv)
-            past_kv = model.generate_latent_batch(
+            past_kv, running_mask = model.generate_latent_batch(
                 input_ids,
                 attention_mask=attn,
                 latent_steps=cond.latent_steps,
                 past_key_values=past_kv,
+                past_attention_mask=running_mask,
+                return_mask=True,
             )
             # one forward pass for the prompt + one per latent step
             latent_forward_passes += 1 + cond.latent_steps
@@ -379,6 +382,8 @@ def run_condition_batch(
                     cond.latent_steps if cond.kv_mode == "latent_only" else tokens_added
                 )
                 past_kv = truncate_past(past_kv, tokens_to_keep)
+                if running_mask is not None and tokens_to_keep > 0:
+                    running_mask = running_mask[:, -tokens_to_keep:]
 
     # --- Judger (text decode, conditioned on accumulated KV) --------------
     judger_enable_thinking = (cond.judger_mode == "think")
@@ -401,6 +406,7 @@ def run_condition_batch(
         temperature=temperature,
         top_p=top_p,
         past_key_values=past_for_decoding,
+        past_attention_mask=(running_mask if past_for_decoding is not None else None),
         skip_special_tokens=False,  # keep <think> tags so we can split budget
     )
 

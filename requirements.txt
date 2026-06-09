@@ -1,6 +1,8 @@
-transformers
+transformers==4.57.6
+vllm==0.14.1
 torch
 numpy
 tqdm
 accelerate
 datasets
+matplotlib
