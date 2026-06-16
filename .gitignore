@@ -3,3 +3,8 @@
 /logs
 
 *.code-workspace
+
+**/*archive*/
+**/*log*/
+**/*output*/
+**/__pycache__/
