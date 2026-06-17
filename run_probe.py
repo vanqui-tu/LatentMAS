@@ -248,6 +248,25 @@ def build_judger_messages(model_name: str, prompt_arch: str, question: str, task
     return build_messages(model_name, prompt_arch, "judger", question, task)
 
 
+# Latent (non-judger) agent presets. Used for the agent-ablation experiment
+# (drop one agent at a time) and for varying the pipeline size.
+AGENT_SETS = {
+    "full":       ["planner", "critic", "refiner"],
+    "no_planner": ["critic", "refiner"],
+    "no_critic":  ["planner", "refiner"],
+    "no_refiner": ["planner", "critic"],
+    "planner":    ["planner"],
+    "critic":     ["critic"],
+    "refiner":    ["refiner"],
+    "none":       [],
+}
+_ROLE_NAME = {"planner": "Planner", "critic": "Critic", "refiner": "Refiner"}
+
+
+def build_agents(agent_set: str) -> List[Agent]:
+    return [Agent(name=_ROLE_NAME[r], role=r) for r in AGENT_SETS[agent_set]]
+
+
 def tokenize_prompts(model: ModelWrapper, prompts: List[str]):
     enc = model.tokenizer(
         prompts, return_tensors="pt", padding=True, add_special_tokens=False
@@ -299,6 +318,8 @@ class Condition:
     judger_max_new_tokens: int
     kv_mode: str            # full | sequential_info_only | latent_only
     latent_source: str      # self | transplant | generic | none
+    agent_set: str          # which latent (non-judger) agents are active
+    final_latent: bool      # judger also thinks in latent, then a decoder verbalizes
     prompt_arch: str        # sequential | hierarchical
     realign: bool
 
@@ -310,6 +331,8 @@ class Condition:
             f"_jb{self.judger_max_new_tokens}"
             f"_kv-{self.kv_mode}"
             f"_src-{self.latent_source}"
+            f"_as-{self.agent_set}"
+            f"_fl{'1' if self.final_latent else '0'}"
             f"_{self.prompt_arch}"
             f"_ra{'1' if self.realign else '0'}"
         )
@@ -385,7 +408,31 @@ def run_condition_batch(
                 if running_mask is not None and tokens_to_keep > 0:
                     running_mask = running_mask[:, -tokens_to_keep:]
 
-    # --- Judger (text decode, conditioned on accumulated KV) --------------
+    # --- direct-v2: let the solver (judger) also think in latent ----------
+    # The judger runs m latent steps on the TARGET question (contributing KV),
+    # then a separate text decode verbalizes the answer. Tests whether pushing
+    # the final reasoning into latent (instead of text CoT) is decodable.
+    if cond.final_latent and cond.latent_steps > 0:
+        jl_prompts = [
+            render_messages(
+                model,
+                build_judger_messages(model.model_name, cond.prompt_arch, it["question"], task, cond.judger_mode),
+                enable_thinking=cond.agent_thinking,
+            )
+            for it in target_items
+        ]
+        jl_ids, jl_attn = tokenize_prompts(model, jl_prompts)
+        past_kv, running_mask = model.generate_latent_batch(
+            jl_ids,
+            attention_mask=jl_attn,
+            latent_steps=cond.latent_steps,
+            past_key_values=past_kv,
+            past_attention_mask=running_mask,
+            return_mask=True,
+        )
+        latent_forward_passes += 1 + cond.latent_steps
+
+    # --- Judger / decoder (text decode, conditioned on accumulated KV) -----
     judger_enable_thinking = (cond.judger_mode == "think")
     judger_prompts = [
         render_messages(
@@ -397,7 +444,8 @@ def run_condition_batch(
     ]
     judger_ids, judger_mask = tokenize_prompts(model, judger_prompts)
 
-    past_for_decoding = past_kv if (cond.latent_steps > 0 and cond.latent_source != "none") else None
+    use_past = past_kv is not None and _past_length(past_kv) > 0
+    past_for_decoding = past_kv if use_past else None
 
     generated, _ = model.generate_text_batch(
         judger_ids,
@@ -483,7 +531,7 @@ def run_task_condition(
     top_p: float,
     rng: random.Random,
 ) -> Dict:
-    agents = default_agents()
+    agents = build_agents(cond.agent_set)
     all_results: List[Dict] = []
     t0 = time.time()
 
@@ -515,6 +563,8 @@ def run_task_condition(
         "judger_max_new_tokens": cond.judger_max_new_tokens,
         "kv_mode": cond.kv_mode,
         "latent_source": cond.latent_source,
+        "agent_set": cond.agent_set,
+        "final_latent": cond.final_latent,
         "prompt_arch": cond.prompt_arch,
         "realign": cond.realign,
         "n": n,
@@ -560,6 +610,11 @@ def main():
     p.add_argument("--latent_source", nargs="+",
                    choices=["self", "transplant", "generic", "none"], default=["self"],
                    help="Where latent agents get their question from.")
+    p.add_argument("--agent_set", nargs="+", choices=list(AGENT_SETS.keys()), default=["full"],
+                   help="Latent (non-judger) agent pipeline(s) to sweep. Use for ablation: "
+                        "full / no_planner / no_critic / no_refiner / single roles / none.")
+    p.add_argument("--final_latent", action="store_true",
+                   help="direct-v2: judger also runs m latent steps before a final text decode.")
 
     # --- fixed knobs ---
     p.add_argument("--judger_max_new_tokens", type=int, default=None,
@@ -621,6 +676,7 @@ def main():
             for jt in jt_list:
                 for kv_mode in args.kv_mode:
                     for src in args.latent_source:
+                      for aset in args.agent_set:
                         cond = Condition(
                             latent_steps=m,
                             judger_mode=jt,
@@ -628,6 +684,8 @@ def main():
                             judger_max_new_tokens=judger_budget,
                             kv_mode=kv_mode,
                             latent_source=src,
+                            agent_set=aset,
+                            final_latent=args.final_latent,
                             prompt_arch=args.prompt,
                             realign=args.latent_space_realign,
                         )
