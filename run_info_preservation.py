@@ -83,6 +83,24 @@ def slice_past_kv(past_kv, start: int, end: int):
     return tuple(sliced_layers)
 
 
+def find_span_kv_positions(model, prompt_text: str, span_text: str, mask_row) -> Optional[Tuple[int, int]]:
+    """Locate `span_text` inside a rendered encoder prompt and return its [start, end)
+    token positions in the (left-padded) KV coordinate system.
+
+    Uses the find + tokenize-prefix pattern. `mask_row` is the encoder attention-mask row
+    (1 for real tokens, 0 for left-padding); its leading zeros give the padding offset.
+    Returns None if the span is not found.
+    """
+    idx = prompt_text.find(span_text)
+    if idx < 0:
+        return None
+    prefix = prompt_text[:idx]
+    start_real = len(model.tokenizer(prefix, add_special_tokens=False)["input_ids"])
+    end_real = len(model.tokenizer(prefix + span_text, add_special_tokens=False)["input_ids"])
+    pad = int((mask_row == 0).sum().item())  # left-padding columns precede real tokens
+    return pad + start_real, pad + end_real
+
+
 # ---------------------------------------------------------------------------
 # Secret key generation
 # ---------------------------------------------------------------------------
@@ -692,14 +710,29 @@ def run_preservation_batch(
         # Only the original prompt KV (first prompt_len positions)
         decoder_kv = slice_past_kv(past_kv, 0, prompt_len)
         decoder_past_mask = enc_full_mask[:, 0:prompt_len]
+    elif cond.kv_pass_mode == "hide_instruction":
+        # Keep the FULL KV but mask out the instruction span so the decoder cannot
+        # read the transformation instruction as text. The latent steps still encode
+        # whatever they computed (they were produced while the instruction was visible).
+        # value + cue + latent remain attendable; only the instruction text is hidden.
+        decoder_kv = past_kv
+        decoder_past_mask = enc_full_mask.clone()
+        for i in range(batch_size):
+            span_text = items[i].get("instruction", "")
+            if not span_text:
+                continue
+            span = find_span_kv_positions(model, encoder_prompts[i], span_text, enc_mask[i])
+            if span is not None:
+                s, e = span
+                decoder_past_mask[i, s:e] = 0
     elif cond.kv_pass_mode == "none":
         decoder_kv = None
         decoder_past_mask = None
     else:
         raise ValueError(f"Unknown kv_pass_mode: {cond.kv_pass_mode}")
 
-    # Free the full KV if we sliced a subset
-    if cond.kv_pass_mode not in ("full",):
+    # Free the full KV if we sliced a subset (full / hide_instruction keep the original)
+    if cond.kv_pass_mode not in ("full", "hide_instruction"):
         del past_kv
 
     # --- Step 4: Build decoder prompts ---
@@ -929,7 +962,7 @@ def main():
                    default=["question_recall", "secret_key", "secret_string"])
     p.add_argument("--latent_steps", type=int, nargs="+", default=[0, 10, 20, 40, 80])
     p.add_argument("--kv_pass_mode", nargs="+",
-                   choices=["full", "latent_only"],
+                   choices=["full", "latent_only", "prompt_only", "hide_instruction", "none"],
                    default=["full", "latent_only"])
     p.add_argument("--secret_key_length", type=int, nargs="+", default=[8, 16, 32],
                    help="Length of random secret keys in chars (only for secret_key probe)")
