@@ -111,8 +111,8 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
 
     # CrossRare / raredisease_mas specific args
-    parser.add_argument("--num_hospitals", type=int, default=5, help="Number of hospital agents for raredisease_mas")
-    parser.add_argument("--retrieval_top_k", type=int, default=3, help="Top-k cases retrieved per hospital")
+    parser.add_argument("--num_hospitals", type=int, default=3, help="Number of hospital agents for raredisease_mas")
+    parser.add_argument("--retrieval_top_k", type=int, default=1, help="Top-k cases retrieved per hospital")
     parser.add_argument("--test_ratio", type=float, default=0.1, help="Fraction of CrossRare data held out for test")
     parser.add_argument("--partition_strategy", type=str, default="random",
                         choices=["random", "round_robin"],

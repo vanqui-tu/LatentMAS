@@ -215,9 +215,13 @@ class RarediseaseMASMethod:
     ) -> List[Tuple]:
         """Run all hospital prompts in one batched forward + latent steps.
 
-        Returns a list (one per hospital) of KV tuples with only the
-        latent-step positions retained (no padding, no prompt tokens).
-        Shape per layer per tensor: [1, heads, latent_steps, dim].
+        This implements the LatentMAS baseline (Appendix C.5 of MedLatentDx paper):
+          - Prefill: forward hospital prompt → KV of length T_i (prompt length)
+          - Latent steps: m autoregressive forward passes → add m more KV positions
+          - Output: full KV cache containing BOTH prompt (T_i) and latent (m) positions
+
+        Returns a list (one per hospital) of KV tuples with per-sample padding stripped.
+        Shape per layer per tensor: [1, heads, T_i + latent_steps, dim].
         """
         num_hospitals = len(hospital_messages)
         device = self.model.device
@@ -270,26 +274,11 @@ class RarediseaseMASMethod:
             past_kv = outputs.past_key_values
             last_hidden = outputs.hidden_states[-1][:, -1, :]
 
-        # ── strip padding + keep ONLY the latent-step positions ────────
+        # ── strip padding only ────────────────────────────────────────
         # full_mask has shape [H, prompt_len + latent_steps]
-        # We want only the last `latent_steps` positions per sample.
+        # Strip left-padding but KEEP all real tokens (prompt + latent).
         kv_stripped = _strip_kv_padding(past_kv, full_mask)
-
-        if self.latent_steps > 0:
-            # Keep only the latent positions (last latent_steps columns).
-            kv_latent: List[Tuple] = []
-            for sample_kv in kv_stripped:
-                kv_latent.append(
-                    tuple(
-                        tuple(t[:, :, -self.latent_steps:, :].contiguous() for t in layer)
-                        for layer in sample_kv
-                    )
-                )
-        else:
-            # latent_steps == 0 → raw KV baseline: keep ALL prompt tokens.
-            kv_latent = kv_stripped
-
-        return kv_latent  # List[num_hospitals] of KV tuples
+        kv_latent = kv_stripped  # Do NOT truncate to latent_steps only
 
     # ------------------------------------------------------------------ #
     # run_batch — process a batch of items                                 #
@@ -384,6 +373,10 @@ class RarediseaseMASMethod:
         # ── host agent: decode final diagnosis ─────────────────────────
         host_messages = build_crossrare_host_prompt(test_phenotype_str)
         host_prompt = self.model.render_chat(host_messages, add_generation_prompt=True)
+
+        # Mirror LatentMAS judger: optionally force thinking via <think> token
+        if getattr(self.args, "think", False):
+            host_prompt = f"{host_prompt}<think>"
 
         host_encoded = self.model.tokenizer(
             host_prompt,
