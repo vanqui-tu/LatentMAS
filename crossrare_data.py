@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import random
+import urllib.request
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
@@ -37,6 +38,41 @@ _PHE2EMB_FILE = _DATA_DIR / "phe2embedding.json"
 _IC_FILE = _DATA_DIR / "ic_dict.json"
 _DISEASE_MAP_FILE = _DATA_DIR / "disease_mapping.json"
 _PHENOTYPE_MAP_FILE = _DATA_DIR / "phenotype_mapping.json"
+
+_HF_MAPPING_BASE = (
+    "https://huggingface.co/datasets/chenxz/RareBench/resolve/main/mapping/"
+)
+
+# Files that may be absent locally and need to be downloaded from HuggingFace.
+_REMOTE_FILES: Dict[Path, str] = {
+    _PHE2EMB_FILE: _HF_MAPPING_BASE + "phe2embedding.json",
+}
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Download helper
+# ────────────────────────────────────────────────────────────────────────────
+
+def _ensure_file(path: Path, url: str) -> None:
+    """Download *url* to *path* if the file does not already exist."""
+    if path.exists():
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    print(f"[CrossRare] '{path.name}' not found locally — downloading from {url} ...")
+    try:
+        urllib.request.urlretrieve(url, path)
+        print(f"[CrossRare] Saved to {path}")
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to download '{path.name}' from {url}.\n"
+            f"Please download it manually and place it at:\n  {path}\n"
+            f"Original error: {exc}"
+        ) from exc
+
+
+def _ensure_all_remote_files() -> None:
+    for path, url in _REMOTE_FILES.items():
+        _ensure_file(path, url)
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -233,6 +269,7 @@ class CrossRareDataset:
         self.top_k = top_k
 
         print("[CrossRare] Loading data...")
+        _ensure_all_remote_files()
         raw = _load_crossrare_raw()
         self.phe2emb = _load_phe2embedding()
         self.ic_dict = _load_ic_dict()
