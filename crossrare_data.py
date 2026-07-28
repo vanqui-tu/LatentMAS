@@ -181,8 +181,17 @@ def split_and_partition(
     num_hospitals: int = 5,
     test_ratio: float = 0.1,
     seed: int = 42,
+    partition_strategy: str = "random",
 ) -> Tuple[List[List[Dict]], List[Dict]]:
     """Shuffle, split 9:1, distribute train across hospitals.
+
+    partition_strategy:
+      - "random"      : each train case is randomly assigned to one hospital
+                        (sizes vary slightly around N/H).
+      - "round_robin" : cases assigned in interleaved order 0,1,...,H-1,0,1,...
+                        (most uniform disease distribution).
+      - "chunk"       : contiguous block per hospital after shuffle
+                        (simple; may have mild locality bias).
 
     Returns:
         hospital_dbs: List[num_hospitals] of case lists (train partition).
@@ -196,10 +205,21 @@ def split_and_partition(
     test_cases = shuffled[:n_test]
     train_cases = shuffled[n_test:]
 
-    # Round-robin distribute train cases to hospitals
     hospital_dbs: List[List[Dict]] = [[] for _ in range(num_hospitals)]
-    for i, case in enumerate(train_cases):
-        hospital_dbs[i % num_hospitals].append(case)
+
+    if partition_strategy == "round_robin":
+        for i, case in enumerate(train_cases):
+            hospital_dbs[i % num_hospitals].append(case)
+
+    elif partition_strategy == "random":
+        for case in train_cases:
+            hospital_dbs[rng.randrange(num_hospitals)].append(case)
+
+    else:
+        raise ValueError(
+            f"Unknown partition_strategy '{partition_strategy}'. "
+            "Choose from: 'random', 'round_robin'."
+        )
 
     return hospital_dbs, test_cases
 
@@ -253,6 +273,7 @@ class CrossRareDataset:
             # item["test_phenotypes"]         — List[str] human-readable
             # item["test_phenotype_ids"]      — List[str] HP codes
             # item["gold"]                    — str disease name
+            # item["gold_aliases"]            — List[str] all valid aliases
             # item["hospital_cases"]          — List[List[Dict]]  (one list per hospital)
             #   each inner dict: {case_disease, case_phenotype}
             # item["question"]                — formatted text for the model
@@ -264,6 +285,7 @@ class CrossRareDataset:
         test_ratio: float = 0.1,
         top_k: int = 3,
         seed: int = 42,
+        partition_strategy: str = "random",
     ) -> None:
         self.num_hospitals = num_hospitals
         self.top_k = top_k
@@ -275,10 +297,19 @@ class CrossRareDataset:
         self.ic_dict = _load_ic_dict()
 
         hospital_dbs, test_cases = split_and_partition(
-            raw, num_hospitals=num_hospitals, test_ratio=test_ratio, seed=seed
+            raw,
+            num_hospitals=num_hospitals,
+            test_ratio=test_ratio,
+            seed=seed,
+            partition_strategy=partition_strategy,
         )
 
-        print(f"[CrossRare] Train: {sum(len(h) for h in hospital_dbs)} cases across {num_hospitals} hospitals | Test: {len(test_cases)}")
+        sizes = [len(h) for h in hospital_dbs]
+        print(
+            f"[CrossRare] Strategy='{partition_strategy}' | "
+            f"Train: {sum(sizes)} cases across {num_hospitals} hospitals "
+            f"(sizes: {sizes}) | Test: {len(test_cases)}"
+        )
 
         self.retrievers = [
             HospitalRetriever(db, self.phe2emb, self.ic_dict, hospital_id=i)
@@ -322,7 +353,19 @@ class CrossRareDataset:
             }
 
 
-def load_crossrare(num_hospitals: int = 5, test_ratio: float = 0.1, top_k: int = 3, seed: int = 42) -> Iterable[Dict]:
-    """Thin wrapper for use in run.py — returns an iterable of test items."""
-    ds = CrossRareDataset(num_hospitals=num_hospitals, test_ratio=test_ratio, top_k=top_k, seed=seed)
+def load_crossrare(
+    num_hospitals: int = 5,
+    test_ratio: float = 0.1,
+    top_k: int = 3,
+    seed: int = 42,
+    partition_strategy: str = "random",
+) -> Iterable[Dict]:
+    """Thin wrapper for use in run.py — returns a list of test items."""
+    ds = CrossRareDataset(
+        num_hospitals=num_hospitals,
+        test_ratio=test_ratio,
+        top_k=top_k,
+        seed=seed,
+        partition_strategy=partition_strategy,
+    )
     return list(ds.test_items())

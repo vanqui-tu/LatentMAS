@@ -114,6 +114,9 @@ def main():
     parser.add_argument("--num_hospitals", type=int, default=5, help="Number of hospital agents for raredisease_mas")
     parser.add_argument("--retrieval_top_k", type=int, default=3, help="Top-k cases retrieved per hospital")
     parser.add_argument("--test_ratio", type=float, default=0.1, help="Fraction of CrossRare data held out for test")
+    parser.add_argument("--partition_strategy", type=str, default="random",
+                        choices=["random", "round_robin"],
+                        help="How to distribute train cases across hospitals")
 
     # vLLM support
     parser.add_argument("--use_vllm", action="store_true", help="Use vLLM backend for generation")
@@ -206,6 +209,7 @@ def main():
             test_ratio=args.test_ratio,
             top_k=args.retrieval_top_k,
             seed=args.seed,
+            partition_strategy=args.partition_strategy,
         )
     else:
         raise ValueError(f'no {args.task} support')
