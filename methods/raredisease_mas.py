@@ -280,6 +280,8 @@ class RarediseaseMASMethod:
         kv_stripped = _strip_kv_padding(past_kv, full_mask)
         kv_latent = kv_stripped  # Do NOT truncate to latent_steps only
 
+        return kv_latent  # List[num_hospitals] of KV tuples
+
     # ------------------------------------------------------------------ #
     # run_batch — process a batch of items                                 #
     # ------------------------------------------------------------------ #
