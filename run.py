@@ -15,9 +15,11 @@ from data import (
     load_humanevalplus,
     load_medqa
 )
+from crossrare_data import load_crossrare
 from methods.baseline import BaselineMethod
 from methods.latent_mas import LatentMASMethod
 from methods.text_mas import TextMASMethod
+from methods.raredisease_mas import RarediseaseMASMethod
 from models import ModelWrapper
 from utils import auto_device, set_seed
 import time
@@ -85,14 +87,14 @@ def main():
     parser = argparse.ArgumentParser()
 
     # core args for experiments
-    parser.add_argument("--method", choices=["baseline", "text_mas", "latent_mas"], required=True,
-                        help="Which multi-agent method to run: 'baseline', 'text_mas', or 'latent_mas'.")
+    parser.add_argument("--method", choices=["baseline", "text_mas", "latent_mas", "raredisease_mas"], required=True,
+                        help="Which multi-agent method to run.")
     parser.add_argument("--model_name", type=str, required=True,
                         choices=["Qwen/Qwen3-4B", "Qwen/Qwen3-4B", "Qwen/Qwen3-14B"],
                         help="Model choices to use for experiments (e.g. 'Qwen/Qwen3-14B').")
     parser.add_argument("--max_samples", type=int, default=-1, help="Number of questions to evaluate; set -1 to use all samples.")
-    parser.add_argument("--task", choices=["gsm8k", "aime2024", "aime2025", "gpqa", "arc_easy", "arc_challenge", "mbppplus", 'humanevalplus', 'medqa'], default="gsm8k",
-                        help="Dataset/task to evaluate. Controls which loader is used.")
+    parser.add_argument("--task", choices=["gsm8k", "aime2024", "aime2025", "gpqa", "arc_easy", "arc_challenge", "mbppplus", 'humanevalplus', 'medqa', 'crossrare'], default="gsm8k",
+                        help="Dataset/task to evaluate.")
     parser.add_argument("--prompt", type=str, choices=["sequential", "hierarchical"], default="sequential", help="Multi-agent system architecture: 'sequential' or 'hierarchical'.")
 
     # other args
@@ -107,6 +109,11 @@ def main():
     parser.add_argument("--think", action="store_true", help="Manually add think token in the prompt for LatentMAS")
     parser.add_argument("--latent_space_realign", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
+
+    # CrossRare / raredisease_mas specific args
+    parser.add_argument("--num_hospitals", type=int, default=5, help="Number of hospital agents for raredisease_mas")
+    parser.add_argument("--retrieval_top_k", type=int, default=3, help="Top-k cases retrieved per hospital")
+    parser.add_argument("--test_ratio", type=float, default=0.1, help="Fraction of CrossRare data held out for test")
 
     # vLLM support
     parser.add_argument("--use_vllm", action="store_true", help="Use vLLM backend for generation")
@@ -160,6 +167,15 @@ def main():
             generate_bs=args.generate_bs, 
             args=args,
         )
+    elif args.method == 'raredisease_mas':
+        method = RarediseaseMASMethod(
+            model,
+            latent_steps=args.latent_steps,
+            host_max_new_tokens=args.max_new_tokens,
+            **common_kwargs,
+            generate_bs=args.generate_bs,
+            args=args,
+        )
 
     preds: List[Dict] = []
     processed = 0
@@ -184,6 +200,13 @@ def main():
         dataset_iter = load_humanevalplus(split='test')
     elif args.task == "medqa":
         dataset_iter = load_medqa(split='test')
+    elif args.task == "crossrare":
+        dataset_iter = load_crossrare(
+            num_hospitals=args.num_hospitals,
+            test_ratio=args.test_ratio,
+            top_k=args.retrieval_top_k,
+            seed=args.seed,
+        )
     else:
         raise ValueError(f'no {args.task} support')
 

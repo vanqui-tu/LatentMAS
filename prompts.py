@@ -1,3 +1,5 @@
+from typing import Dict, List
+
 
 def build_agent_message_sequential_latent_mas(role: str, question: str, context: str = "", method=None, args=None):
 
@@ -688,6 +690,63 @@ Your response:
     return [
         {"role": "system", "content": system_message},
         {"role": "user", "content": user_content},
+    ]
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# CrossRare / MedLatentDx prompts  (templates A, B, C from the paper)
+# ────────────────────────────────────────────────────────────────────────────
+
+def build_crossrare_system_prompt() -> str:
+    """Template A — shared system prompt for all latent methods."""
+    return (
+        "You are a specialist in the field of rare diseases. "
+        "You will be provided with similar cases from multiple hospitals "
+        "to help diagnose a patient."
+    )
+
+
+def build_crossrare_hospital_prompt(
+    hospital_id: int,
+    case_disease: str,
+    case_phenotype: str,
+    test_phenotype: str,
+) -> List[Dict]:
+    """Template B — hospital agent prompt encoded by each hospital.
+
+    Each hospital sees ONE retrieved similar case plus the test phenotype query.
+    The model is asked to reason about likely diagnoses before producing its
+    latent block — this is the 'think before you distil' step.
+    """
+    system = build_crossrare_system_prompt()
+    user = (
+        f"A similar case from Hospital {hospital_id}:\n"
+        f"The patient has a rare disease [{case_disease}], "
+        f"and his/her phenotype is as follows: [{case_phenotype}].\n\n"
+        f"Now consider the following patient case:\n"
+        f"Patient's phenotype: {test_phenotype}\n\n"
+        f"Think about what diagnoses are most likely for this patient."
+    )
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+
+def build_crossrare_host_prompt(test_phenotype: str) -> List[Dict]:
+    """Template C — final diagnosis question sent to the host agent."""
+    system = build_crossrare_system_prompt()
+    user = (
+        f"Based on the information above, what is the single most likely "
+        f"diagnosis for this patient?\n\n"
+        f"Patient's phenotype: {test_phenotype}\n\n"
+        f"Put your final answer inside <answer> tags. "
+        f"Only the disease name, no explanations.\n"
+        f"Example format: <answer>Disease A</answer>"
+    )
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
     ]
 
 
