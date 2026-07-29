@@ -176,6 +176,8 @@ def main():
     # CrossRare / raredisease_mas specific args
     parser.add_argument("--num_hospitals", type=int, default=5, help="Number of simulated hospital databases for CrossRare")
     parser.add_argument("--hospital_agents", type=int, default=3, help="Hospital agents selected per CrossRare query")
+    parser.add_argument("--agent_hospital_ids", type=int, nargs=3, default=[1, 2, 3],
+                        help="One-based IDs of the three CrossRare retrieval hospitals")
     parser.add_argument("--retrieval_top_k", type=int, default=1, help="Top-k cases retrieved per hospital")
     parser.add_argument("--test_ratio", type=float, default=0.05, help="Fraction of CrossRare data held out for test")
     parser.add_argument("--val_ratio", type=float, default=0.05, help="Fraction of CrossRare data held out for validation")
@@ -287,6 +289,7 @@ def main():
         dataset_iter = load_crossrare(
             num_hospitals=args.num_hospitals,
             num_active_hospitals=args.hospital_agents,
+            agent_hospital_ids=args.agent_hospital_ids,
             test_ratio=args.test_ratio,
             val_ratio=args.val_ratio,
             top_k=args.retrieval_top_k,

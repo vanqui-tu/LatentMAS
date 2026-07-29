@@ -214,16 +214,17 @@ embeddings.  Each hospital transmits exactly `latent_steps + 2` KV positions
 (BOP, compact latent suffix, EOP), regardless of its local prompt length.
 
 Train the latent interface on a 90/5/5 train/validation/test split. The 90%
-public train split is partitioned into five hospital databases; each episode
-deterministically selects three hospitals and retrieves one case from each.
-The trainer saves the lowest-validation-CE checkpoint. Self-retrieval is
-excluded for training records.
+public train split is partitioned into five hospital databases. Hospitals 1-3
+are the three fixed local retrieval agents by default; training queries and
+labels are drawn only from hospitals 4-5, so a train query is absent from all
+retrieval databases. The trainer saves the lowest-validation-CE checkpoint.
 
 ```bash
 python train_medlatentdx_h.py \
   --model_name Qwen/Qwen3-8B \
   --output_checkpoint outputs/medlatentdx_h_qwen3_8b.pt \
   --latent_steps 32 --num_hospitals 5 --hospital_agents 3 --retrieval_top_k 1 \
+  --agent_hospital_ids 1 2 3 \
   --test_ratio 0.05 --val_ratio 0.05 \
   --epochs 5 --batch_size 8 --warmup_steps 100 --learning_rate 1e-4 \
   --weight_decay 0.01 --max_prompt_length 320 --max_target_length 64 --device cuda
@@ -237,6 +238,7 @@ python run.py --method medlatentdx_h --task crossrare \
   --model_name Qwen/Qwen3-8B \
   --distiller_checkpoint outputs/medlatentdx_h_qwen3_8b.pt \
   --latent_steps 32 --num_hospitals 5 --hospital_agents 3 --retrieval_top_k 1 \
+  --agent_hospital_ids 1 2 3 \
   --test_ratio 0.05 --val_ratio 0.05 \
   --max_prompt_length 320 --max_new_tokens 64 --temperature 0 --generate_bs 1 --device cuda
 ```

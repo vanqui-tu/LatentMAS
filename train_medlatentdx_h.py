@@ -18,6 +18,8 @@ def main() -> None:
     parser.add_argument("--latent_steps", type=int, default=32)
     parser.add_argument("--num_hospitals", type=int, default=5)
     parser.add_argument("--hospital_agents", type=int, default=3)
+    parser.add_argument("--agent_hospital_ids", type=int, nargs=3, default=[1, 2, 3],
+                        help="One-based IDs of the three hospitals providing local retrieval.")
     parser.add_argument("--retrieval_top_k", type=int, default=1)
     parser.add_argument("--test_ratio", type=float, default=0.05)
     parser.add_argument("--val_ratio", type=float, default=0.05)
@@ -29,12 +31,14 @@ def main() -> None:
     parser.add_argument("--batch_size", type=int, default=8,
                         help="Episodes accumulated per AdamW update; caches are not padded together.")
     parser.add_argument("--grad_accumulation", type=int, default=1)
+    parser.add_argument("--log_every", type=int, default=1,
+                        help="Print training metrics every N optimizer updates.")
     parser.add_argument("--max_prompt_length", type=int, default=320)
     parser.add_argument("--max_target_length", type=int, default=64)
     parser.add_argument("--max_train_samples", type=int, default=-1)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
-    if min(args.latent_steps, args.epochs, args.batch_size, args.grad_accumulation,
+    if min(args.latent_steps, args.epochs, args.batch_size, args.grad_accumulation, args.log_every,
            args.max_prompt_length, args.max_target_length) <= 0:
         parser.error("all length, batch, epoch, and accumulation settings must be positive")
     if (args.num_hospitals, args.hospital_agents, args.retrieval_top_k) != (5, 3, 1):
@@ -54,10 +58,12 @@ def main() -> None:
     optimizer = torch.optim.AdamW(method.distiller.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
 
     dataset = CrossRareDataset(num_hospitals=args.num_hospitals, num_active_hospitals=args.hospital_agents,
+                               agent_hospital_ids=args.agent_hospital_ids,
                                test_ratio=args.test_ratio, val_ratio=args.val_ratio,
                                top_k=args.retrieval_top_k, seed=args.seed,
                                partition_strategy=args.partition_strategy)
     examples = dataset.train_items()
+    total_query_examples = len(examples)
     if args.max_train_samples > 0:
         examples = examples[:args.max_train_samples]
     if not examples:
@@ -65,6 +71,13 @@ def main() -> None:
     validation_examples = dataset.val_items()
     if not validation_examples:
         raise RuntimeError("No CrossRare validation examples available")
+    query_hospitals = [hospital_id for hospital_id in range(1, args.num_hospitals + 1)
+                       if hospital_id not in args.agent_hospital_ids]
+    print(
+        f"[Train] Query/label episodes: {len(examples)}/{total_query_examples} from hospitals {query_hospitals}; "
+        f"retrieval hospitals: {args.agent_hospital_ids}",
+        flush=True,
+    )
 
     # Each episode has a different stitched cache length. Accumulating their
     # gradients is mathematically equivalent to a padded batch for this loss.
@@ -77,20 +90,38 @@ def main() -> None:
     method.distiller.train()
     optimizer.zero_grad(set_to_none=True)
     best_validation_loss = float("inf")
+    global_update = 0
     for epoch in range(args.epochs):
         random.Random(args.seed + epoch).shuffle(examples)
         mean_loss = 0.0
+        update_loss = 0.0
+        update_examples = 0
+        updates_per_epoch = (len(examples) + update_size - 1) // update_size
         for step, item in enumerate(examples, start=1):
             loss = method.diagnosis_loss(item)
             chunk_start = ((step - 1) // update_size) * update_size
             chunk_size = min(update_size, len(examples) - chunk_start)
             (loss / chunk_size).backward()
             mean_loss += float(loss.detach())
+            update_loss += float(loss.detach())
+            update_examples += 1
             if step % update_size == 0 or step == len(examples):
                 torch.nn.utils.clip_grad_norm_(method.distiller.parameters(), 1.0)
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
+                global_update += 1
+                epoch_update = (step + update_size - 1) // update_size
+                if global_update % args.log_every == 0:
+                    print(
+                        f"epoch={epoch + 1}/{args.epochs} "
+                        f"update={epoch_update}/{updates_per_epoch} global_update={global_update} "
+                        f"train_ce={update_loss / update_examples:.6f} "
+                        f"lr={scheduler.get_last_lr()[0]:.2e}",
+                        flush=True,
+                    )
+                update_loss = 0.0
+                update_examples = 0
         method.distiller.eval()
         with torch.no_grad():
             validation_loss = sum(float(method.diagnosis_loss(item)) for item in validation_examples) / len(validation_examples)

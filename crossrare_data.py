@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import json
 import random
-import hashlib
 import urllib.request
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -296,6 +295,7 @@ class CrossRareDataset:
         self,
         num_hospitals: int = 5,
         num_active_hospitals: int = 3,
+        agent_hospital_ids: Optional[List[int]] = None,
         test_ratio: float = 0.05,
         val_ratio: float = 0.05,
         top_k: int = 3,
@@ -308,6 +308,15 @@ class CrossRareDataset:
         self.seed = seed
         if not 1 <= num_active_hospitals <= num_hospitals:
             raise ValueError("num_active_hospitals must be between 1 and num_hospitals")
+        if agent_hospital_ids is None:
+            agent_hospital_ids = list(range(1, num_active_hospitals + 1))
+        if len(agent_hospital_ids) != num_active_hospitals:
+            raise ValueError("agent_hospital_ids must contain num_active_hospitals unique one-based IDs")
+        if len(set(agent_hospital_ids)) != len(agent_hospital_ids) or any(
+            hospital_id < 1 or hospital_id > num_hospitals for hospital_id in agent_hospital_ids
+        ):
+            raise ValueError("agent_hospital_ids must be unique IDs from 1 through num_hospitals")
+        self.agent_hospital_ids = tuple(sorted(agent_hospital_ids))
 
         print("[CrossRare] Loading data...")
         _ensure_all_remote_files()
@@ -329,7 +338,7 @@ class CrossRareDataset:
             f"[CrossRare] Strategy='{partition_strategy}' | "
             f"Train: {sum(sizes)} cases across {num_hospitals} hospitals "
             f"(sizes: {sizes}) | Val: {len(val_cases)} | Test: {len(test_cases)} | "
-            f"Agents/query: {num_active_hospitals}"
+            f"Retrieval hospitals: {self.agent_hospital_ids} | Agents/query: {num_active_hospitals}"
         )
 
         self.retrievers = [
@@ -340,16 +349,9 @@ class CrossRareDataset:
         self.val_cases = val_cases
         self.test_cases = test_cases
 
-    def _active_retrievers(self, case_id: str) -> List[Tuple[int, HospitalRetriever]]:
-        """Choose N of the five simulated hospitals reproducibly per episode."""
-        if self.num_active_hospitals == self.num_hospitals:
-            indices = list(range(self.num_hospitals))
-        else:
-            digest = hashlib.sha256(f"{self.seed}:{case_id}".encode("utf-8")).digest()
-            indices = sorted(random.Random(int.from_bytes(digest[:8], "big")).sample(
-                range(self.num_hospitals), self.num_active_hospitals
-            ))
-        return [(index, self.retrievers[index]) for index in indices]
+    def _active_retrievers(self) -> List[Tuple[int, HospitalRetriever]]:
+        """The fixed N local hospitals that serve retrieval for this experiment."""
+        return [(hospital_id - 1, self.retrievers[hospital_id - 1]) for hospital_id in self.agent_hospital_ids]
 
     def _make_item(self, case: Dict, exclude_self: bool) -> Dict:
         query_ids = case["phenotype_ids"]
@@ -357,7 +359,7 @@ class CrossRareDataset:
         gold = _clean_disease_name(case["disease"])
         hospital_cases = []
         hospital_ids = []
-        for hospital_index, retriever in self._active_retrievers(case.get("id", "")):
+        for hospital_index, retriever in self._active_retrievers():
             retrieved = retriever.retrieve(query_ids, self.phe2emb, self.ic_dict, top_k=self.top_k,
                                            exclude_id=case.get("id") if exclude_self else None)
             hospital_cases.append([{"case_disease": _clean_disease_name(r["disease"]),
@@ -370,8 +372,17 @@ class CrossRareDataset:
                 "question": "Patient's phenotype: " + ", ".join(query_phenotypes), "solution": gold}
 
     def train_items(self) -> List[Dict]:
-        """Train episodes with self-retrieval removed to prevent label leakage."""
-        return [self._make_item(case, exclude_self=True) for db in self.hospital_dbs for case in db]
+        """Query/labels from the two hospitals outside the retrieval coalition.
+
+        With five partitions and N=3 local agents, these records are not present
+        in any hospital database used by retrieval for the episode.
+        """
+        return [
+            self._make_item(case, exclude_self=True)
+            for hospital_index, database in enumerate(self.hospital_dbs, start=1)
+            if hospital_index not in self.agent_hospital_ids
+            for case in database
+        ]
 
     def val_items(self) -> List[Dict]:
         """Validation episodes; no validation record belongs to a hospital DB."""
@@ -386,6 +397,7 @@ class CrossRareDataset:
 def load_crossrare(
     num_hospitals: int = 5,
     num_active_hospitals: int = 3,
+    agent_hospital_ids: Optional[List[int]] = None,
     test_ratio: float = 0.05,
     val_ratio: float = 0.05,
     top_k: int = 3,
@@ -396,6 +408,7 @@ def load_crossrare(
     ds = CrossRareDataset(
         num_hospitals=num_hospitals,
         num_active_hospitals=num_active_hospitals,
+        agent_hospital_ids=agent_hospital_ids,
         test_ratio=test_ratio,
         val_ratio=val_ratio,
         top_k=top_k,
