@@ -5,6 +5,28 @@ import matplotlib.pyplot as plt
 from typing import Dict, List, Optional, Tuple
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+
+def _as_transformers_cache(past_key_values):
+    """Convert legacy tuple KV into the Cache API required by recent Qwen.
+
+    Latent communication concatenates layer KV tensors directly, which naturally
+    produces the legacy tuple representation. Transformers 4.5x Qwen models
+    require a ``Cache`` object at the next model forward. Conversion preserves
+    tensor references and therefore gradients to learned latent embeddings.
+    """
+    if past_key_values is None or hasattr(past_key_values, "get_seq_length"):
+        return past_key_values
+    from transformers.cache_utils import DynamicCache
+
+    from_legacy = getattr(DynamicCache, "from_legacy_cache", None)
+    if from_legacy is not None:
+        return from_legacy(past_key_values)
+
+    cache = DynamicCache()
+    for layer_idx, layer in enumerate(past_key_values):
+        cache.update(layer[0], layer[1], layer_idx)
+    return cache
+
 try:
     from vllm import LLM, SamplingParams
     _HAS_VLLM = True
@@ -25,6 +47,8 @@ def _ensure_pad_token(tokenizer: AutoTokenizer) -> None:
 def _past_length(past_key_values: Optional[Tuple]) -> int:
     if not past_key_values:
         return 0
+    if hasattr(past_key_values, "get_seq_length"):
+        return int(past_key_values.get_seq_length())
     k = past_key_values[0][0]
     return k.shape[-2]
 
@@ -231,6 +255,7 @@ class ModelWrapper:
     ) -> Tuple[List[str], Optional[Tuple]]:
         if input_ids.dim() != 2:
             raise ValueError("input_ids must be 2D with shape [batch, seq_len]")
+        past_key_values = _as_transformers_cache(past_key_values)
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids, device=self.device)
         cache_position = None

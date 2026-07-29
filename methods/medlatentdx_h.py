@@ -13,7 +13,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 from torch import nn
 
-from models import ModelWrapper, _past_length, _positions_from_mask
+from models import ModelWrapper, _as_transformers_cache, _past_length, _positions_from_mask
 from methods.raredisease_mas import (
     _concat_kv_list,
     _disease_match,
@@ -229,7 +229,7 @@ class MedLatentDxHMethod:
             inputs_embeds=inputs,
             attention_mask=mask,
             position_ids=_positions_from_mask(mask, current_ids.shape[1]),
-            past_key_values=compact_cache,
+            past_key_values=_as_transformers_cache(compact_cache),
             labels=labels,
             use_cache=False,
             return_dict=True,
@@ -254,7 +254,7 @@ class MedLatentDxHMethod:
                 max_new_tokens=self.host_max_new_tokens,
                 temperature=self.temperature,
                 top_p=self.top_p,
-                past_key_values=cache,
+                past_key_values=_as_transformers_cache(cache),
                 past_attention_mask=torch.ones(1, _past_length(cache), dtype=torch.long, device=self.model.device),
             )
             raw = generated[0].strip()
