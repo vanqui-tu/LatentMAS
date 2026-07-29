@@ -1,5 +1,8 @@
 import argparse
 import json
+import os
+import re
+import time
 from typing import Dict, List, Tuple
 
 from tqdm import tqdm
@@ -30,6 +33,64 @@ def evaluate(preds: List[Dict]) -> Tuple[float, int]:
     correct = sum(1 for p in preds if p.get("correct", False))
     acc = correct / total if total > 0 else 0.0
     return acc, correct
+
+
+def _safe_name(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._") or "result"
+
+
+def save_results(preds: List[Dict], args: argparse.Namespace, acc: float, correct: int, total_time: float) -> None:
+    output_dir = os.path.abspath(args.output_dir)
+    os.makedirs(output_dir, exist_ok=True)
+
+    model_name = _safe_name(args.model_name)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    results_path = os.path.join(output_dir, f"{args.method}_{model_name}_{ts}_results.json")
+    summary_path = os.path.join(output_dir, f"{args.method}_{model_name}_{ts}_summary.json")
+    jsonl_path = os.path.join(output_dir, f"{args.method}_{model_name}_{ts}_results.jsonl")
+
+    rows = []
+    for item in preds:
+        rows.append(
+            {
+                "id": item.get("id", ""),
+                "ground_truth": item.get("gold", ""),
+                "predicted_text": item.get("prediction", ""),
+                "correct": bool(item.get("correct", False)),
+                "raw_prediction": item.get("raw_prediction", ""),
+                "question": item.get("question", ""),
+            }
+        )
+
+    with open(results_path, "w", encoding="utf-8") as f:
+        json.dump(rows, f, ensure_ascii=False, indent=2)
+
+    with open(jsonl_path, "w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    summary = {
+        "method": args.method,
+        "model": args.model_name,
+        "task": args.task,
+        "split": args.split,
+        "seed": args.seed,
+        "max_samples": args.max_samples,
+        "accuracy": acc,
+        "correct": correct,
+        "total": len(preds),
+        "total_time_sec": round(total_time, 4),
+        "time_per_sample_sec": round(total_time / max(len(preds), 1), 4),
+        "output_dir": output_dir,
+        "results_json": results_path,
+        "results_jsonl": jsonl_path,
+    }
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+
+    print(f"[Results] Saved {len(rows)} rows to {results_path}")
+    print(f"[Results] Summary saved to {summary_path}")
+
 
 # Main processing function for each batch
 def process_batch(
@@ -90,7 +151,7 @@ def main():
     parser.add_argument("--method", choices=["baseline", "text_mas", "latent_mas", "raredisease_mas"], required=True,
                         help="Which multi-agent method to run.")
     parser.add_argument("--model_name", type=str, required=True,
-                        choices=["Qwen/Qwen3-4B", "Qwen/Qwen3-4B", "Qwen/Qwen3-14B"],
+                        choices=["Qwen/Qwen3-4B", "Qwen/Qwen3-8B", "Qwen/Qwen3-14B", "Qwen/Qwen3-4B-Instruct-2507"],
                         help="Model choices to use for experiments (e.g. 'Qwen/Qwen3-14B').")
     parser.add_argument("--max_samples", type=int, default=-1, help="Number of questions to evaluate; set -1 to use all samples.")
     parser.add_argument("--task", choices=["gsm8k", "aime2024", "aime2025", "gpqa", "arc_easy", "arc_challenge", "mbppplus", 'humanevalplus', 'medqa', 'crossrare'], default="gsm8k",
@@ -109,6 +170,7 @@ def main():
     parser.add_argument("--think", action="store_true", help="Manually add think token in the prompt for LatentMAS")
     parser.add_argument("--latent_space_realign", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--output_dir", type=str, default="./outputs/run_results", help="Directory to save JSON/JSONL evaluation outputs")
 
     # CrossRare / raredisease_mas specific args
     parser.add_argument("--num_hospitals", type=int, default=3, help="Number of hospital agents for raredisease_mas")
@@ -253,6 +315,7 @@ def main():
     total_time = time.time() - start_time
 
     acc, correct = evaluate(preds)
+    save_results(preds, args, acc, correct, total_time)
     
     # Load results in JSON format
     print(
@@ -266,7 +329,7 @@ def main():
                 "accuracy": acc,
                 "correct": correct,
                 "total_time_sec": round(total_time,4),
-                "time_per_sample_sec": round(total_time / args.max_samples, 4),
+                "time_per_sample_sec": round(total_time / max(args.max_samples, 1), 4),
             },
             ensure_ascii=False,
         )

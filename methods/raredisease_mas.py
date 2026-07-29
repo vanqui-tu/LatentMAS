@@ -376,9 +376,9 @@ class RarediseaseMASMethod:
         host_messages = build_crossrare_host_prompt(test_phenotype_str)
         host_prompt = self.model.render_chat(host_messages, add_generation_prompt=True)
 
-        # Mirror LatentMAS judger: optionally force thinking via <think> token
-        if getattr(self.args, "think", False):
-            host_prompt = f"{host_prompt}<think>"
+        # # Mirror LatentMAS judger: optionally force thinking via <think> token
+        # if getattr(self.args, "think", False):
+        #     host_prompt = f"{host_prompt}<think>"
 
         host_encoded = self.model.tokenizer(
             host_prompt,
