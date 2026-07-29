@@ -23,6 +23,7 @@ from methods.baseline import BaselineMethod
 from methods.latent_mas import LatentMASMethod
 from methods.text_mas import TextMASMethod
 from methods.raredisease_mas import RarediseaseMASMethod
+from methods.medlatentdx_h import MedLatentDxHMethod
 from models import ModelWrapper
 from utils import auto_device, set_seed
 import time
@@ -148,7 +149,7 @@ def main():
     parser = argparse.ArgumentParser()
 
     # core args for experiments
-    parser.add_argument("--method", choices=["baseline", "text_mas", "latent_mas", "raredisease_mas"], required=True,
+    parser.add_argument("--method", choices=["baseline", "text_mas", "latent_mas", "raredisease_mas", "medlatentdx_h"], required=True,
                         help="Which multi-agent method to run.")
     parser.add_argument("--model_name", type=str, required=True,
                         choices=["Qwen/Qwen3-4B", "Qwen/Qwen3-8B", "Qwen/Qwen3-14B", "Qwen/Qwen3-4B-Instruct-2507"],
@@ -173,12 +174,18 @@ def main():
     parser.add_argument("--output_dir", type=str, default="./outputs/run_results", help="Directory to save JSON/JSONL evaluation outputs")
 
     # CrossRare / raredisease_mas specific args
-    parser.add_argument("--num_hospitals", type=int, default=3, help="Number of hospital agents for raredisease_mas")
+    parser.add_argument("--num_hospitals", type=int, default=5, help="Number of simulated hospital databases for CrossRare")
+    parser.add_argument("--hospital_agents", type=int, default=3, help="Hospital agents selected per CrossRare query")
     parser.add_argument("--retrieval_top_k", type=int, default=1, help="Top-k cases retrieved per hospital")
-    parser.add_argument("--test_ratio", type=float, default=0.1, help="Fraction of CrossRare data held out for test")
+    parser.add_argument("--test_ratio", type=float, default=0.05, help="Fraction of CrossRare data held out for test")
+    parser.add_argument("--val_ratio", type=float, default=0.05, help="Fraction of CrossRare data held out for validation")
     parser.add_argument("--partition_strategy", type=str, default="random",
                         choices=["random", "round_robin"],
                         help="How to distribute train cases across hospitals")
+    parser.add_argument("--distiller_checkpoint", type=str, default=None,
+                        help="Trained MedLatentDx-H distiller checkpoint.")
+    parser.add_argument("--max_prompt_length", type=int, default=320,
+                        help="Local and host prompt token limit for MedLatentDx-H.")
 
     # vLLM support
     parser.add_argument("--use_vllm", action="store_true", help="Use vLLM backend for generation")
@@ -241,6 +248,17 @@ def main():
             generate_bs=args.generate_bs,
             args=args,
         )
+    elif args.method == 'medlatentdx_h':
+        if args.task != "crossrare" or not args.distiller_checkpoint:
+            parser.error("medlatentdx_h requires --task crossrare and --distiller_checkpoint")
+        if (args.num_hospitals, args.hospital_agents, args.retrieval_top_k) != (5, 3, 1):
+            parser.error("medlatentdx_h reproduction fixes five hospital partitions, three agents/query, and top-1 retrieval")
+        method = MedLatentDxHMethod.from_checkpoint(
+            model, args.distiller_checkpoint, latent_steps=args.latent_steps,
+            max_prompt_length=args.max_prompt_length,
+            host_max_new_tokens=args.max_new_tokens, **common_kwargs,
+            generate_bs=args.generate_bs, args=args,
+        )
 
     preds: List[Dict] = []
     processed = 0
@@ -268,7 +286,9 @@ def main():
     elif args.task == "crossrare":
         dataset_iter = load_crossrare(
             num_hospitals=args.num_hospitals,
+            num_active_hospitals=args.hospital_agents,
             test_ratio=args.test_ratio,
+            val_ratio=args.val_ratio,
             top_k=args.retrieval_top_k,
             seed=args.seed,
             partition_strategy=args.partition_strategy,

@@ -1,0 +1,107 @@
+"""Train the Section 3.2 MedLatentDx-H latent interface on CrossRare."""
+import argparse
+import random
+
+import torch
+
+from crossrare_data import CrossRareDataset
+from methods.medlatentdx_h import MedLatentDxHMethod, SameBackboneDistiller, _hidden_size
+from models import ModelWrapper
+from utils import auto_device, set_seed
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model_name", required=True)
+    parser.add_argument("--output_checkpoint", required=True)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--latent_steps", type=int, default=32)
+    parser.add_argument("--num_hospitals", type=int, default=5)
+    parser.add_argument("--hospital_agents", type=int, default=3)
+    parser.add_argument("--retrieval_top_k", type=int, default=1)
+    parser.add_argument("--test_ratio", type=float, default=0.05)
+    parser.add_argument("--val_ratio", type=float, default=0.05)
+    parser.add_argument("--partition_strategy", choices=["random", "round_robin"], default="random")
+    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--learning_rate", type=float, default=1e-4)
+    parser.add_argument("--weight_decay", type=float, default=0.01)
+    parser.add_argument("--warmup_steps", type=int, default=100)
+    parser.add_argument("--batch_size", type=int, default=8,
+                        help="Episodes accumulated per AdamW update; caches are not padded together.")
+    parser.add_argument("--grad_accumulation", type=int, default=1)
+    parser.add_argument("--max_prompt_length", type=int, default=320)
+    parser.add_argument("--max_target_length", type=int, default=64)
+    parser.add_argument("--max_train_samples", type=int, default=-1)
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
+    if min(args.latent_steps, args.epochs, args.batch_size, args.grad_accumulation,
+           args.max_prompt_length, args.max_target_length) <= 0:
+        parser.error("all length, batch, epoch, and accumulation settings must be positive")
+    if (args.num_hospitals, args.hospital_agents, args.retrieval_top_k) != (5, 3, 1):
+        parser.error("MedLatentDx-H reproduction fixes five hospital partitions, three agents/query, and top-1 retrieval")
+
+    set_seed(args.seed)
+    device = auto_device(args.device)
+    model = ModelWrapper(args.model_name, device, args=args)
+    # Frozen LLMs are part of the objective but never optimizer parameters.
+    model.model.requires_grad_(False)
+    model.model.eval()
+    distiller = SameBackboneDistiller(_hidden_size(model.model))
+    method = MedLatentDxHMethod(
+        model, distiller=distiller, latent_steps=args.latent_steps,
+        max_prompt_length=args.max_prompt_length, max_target_length=args.max_target_length, args=args,
+    )
+    optimizer = torch.optim.AdamW(method.distiller.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+
+    dataset = CrossRareDataset(num_hospitals=args.num_hospitals, num_active_hospitals=args.hospital_agents,
+                               test_ratio=args.test_ratio, val_ratio=args.val_ratio,
+                               top_k=args.retrieval_top_k, seed=args.seed,
+                               partition_strategy=args.partition_strategy)
+    examples = dataset.train_items()
+    if args.max_train_samples > 0:
+        examples = examples[:args.max_train_samples]
+    if not examples:
+        raise RuntimeError("No CrossRare training examples available")
+    validation_examples = dataset.val_items()
+    if not validation_examples:
+        raise RuntimeError("No CrossRare validation examples available")
+
+    # Each episode has a different stitched cache length. Accumulating their
+    # gradients is mathematically equivalent to a padded batch for this loss.
+    update_size = args.batch_size * args.grad_accumulation
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda=lambda step: min(1.0, float(step + 1) / max(1, args.warmup_steps)),
+    )
+
+    method.distiller.train()
+    optimizer.zero_grad(set_to_none=True)
+    best_validation_loss = float("inf")
+    for epoch in range(args.epochs):
+        random.Random(args.seed + epoch).shuffle(examples)
+        mean_loss = 0.0
+        for step, item in enumerate(examples, start=1):
+            loss = method.diagnosis_loss(item)
+            chunk_start = ((step - 1) // update_size) * update_size
+            chunk_size = min(update_size, len(examples) - chunk_start)
+            (loss / chunk_size).backward()
+            mean_loss += float(loss.detach())
+            if step % update_size == 0 or step == len(examples):
+                torch.nn.utils.clip_grad_norm_(method.distiller.parameters(), 1.0)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+        method.distiller.eval()
+        with torch.no_grad():
+            validation_loss = sum(float(method.diagnosis_loss(item)) for item in validation_examples) / len(validation_examples)
+        print(f"epoch={epoch + 1} train_ce={mean_loss / len(examples):.6f} val_ce={validation_loss:.6f} lr={scheduler.get_last_lr()[0]:.2e}")
+        if validation_loss < best_validation_loss:
+            best_validation_loss = validation_loss
+            method.save_checkpoint(args.output_checkpoint)
+            print(f"Saved best checkpoint (val_ce={validation_loss:.6f}): {args.output_checkpoint}")
+        method.distiller.train()
+    print(f"Best validation CE: {best_validation_loss:.6f}")
+
+
+if __name__ == "__main__":
+    main()

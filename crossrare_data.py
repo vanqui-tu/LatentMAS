@@ -22,9 +22,10 @@ from __future__ import annotations
 
 import json
 import random
+import hashlib
 import urllib.request
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 
@@ -180,10 +181,11 @@ def split_and_partition(
     data: List[Dict],
     num_hospitals: int = 5,
     test_ratio: float = 0.1,
+    val_ratio: float = 0.0,
     seed: int = 42,
     partition_strategy: str = "random",
-) -> Tuple[List[List[Dict]], List[Dict]]:
-    """Shuffle, split 9:1, distribute train across hospitals.
+) -> Tuple:
+    """Shuffle, split train/validation/test, then distribute train hospitals.
 
     partition_strategy:
       - "random"      : each train case is randomly assigned to one hospital
@@ -195,15 +197,21 @@ def split_and_partition(
 
     Returns:
         hospital_dbs: List[num_hospitals] of case lists (train partition).
-        test_cases:   List of test cases.
+        If ``val_ratio`` is zero, returns ``(hospital_dbs, test_cases)`` for
+        backwards compatibility. Otherwise returns
+        ``(hospital_dbs, val_cases, test_cases)``.
     """
     rng = random.Random(seed)
     shuffled = list(data)
     rng.shuffle(shuffled)
 
+    if test_ratio <= 0 or val_ratio < 0 or test_ratio + val_ratio >= 1:
+        raise ValueError("test_ratio must be positive and test_ratio + val_ratio must be below 1")
     n_test = max(1, int(len(shuffled) * test_ratio))
+    n_val = max(1, int(len(shuffled) * val_ratio)) if val_ratio else 0
     test_cases = shuffled[:n_test]
-    train_cases = shuffled[n_test:]
+    val_cases = shuffled[n_test:n_test + n_val]
+    train_cases = shuffled[n_test + n_val:]
 
     hospital_dbs: List[List[Dict]] = [[] for _ in range(num_hospitals)]
 
@@ -221,6 +229,8 @@ def split_and_partition(
             "Choose from: 'random', 'round_robin'."
         )
 
+    if val_ratio:
+        return hospital_dbs, val_cases, test_cases
     return hospital_dbs, test_cases
 
 
@@ -249,14 +259,17 @@ class HospitalRetriever:
         ]
         self.embeddings = np.stack(embs, axis=0)  # [N, D]
 
-    def retrieve(self, query_ids: List[str], phe2emb: Dict, ic_dict: Dict, top_k: int = 3) -> List[Dict]:
+    def retrieve(self, query_ids: List[str], phe2emb: Dict, ic_dict: Dict, top_k: int = 3, exclude_id: Optional[str] = None) -> List[Dict]:
         """Return top_k most similar cases from local database."""
         if not self.cases:
             return []
 
         q_emb = _normalize(case_embedding(query_ids, phe2emb, ic_dict))
         scores = self.embeddings @ q_emb  # [N]
-        top_indices = np.argsort(scores)[::-1][:top_k]
+        top_indices = np.argsort(scores)[::-1]
+        if exclude_id is not None:
+            top_indices = [i for i in top_indices if self.cases[i].get("id") != exclude_id]
+        top_indices = top_indices[:top_k]
         return [self.cases[i] for i in top_indices]
 
 
@@ -282,13 +295,19 @@ class CrossRareDataset:
     def __init__(
         self,
         num_hospitals: int = 5,
-        test_ratio: float = 0.1,
+        num_active_hospitals: int = 3,
+        test_ratio: float = 0.05,
+        val_ratio: float = 0.05,
         top_k: int = 3,
         seed: int = 42,
         partition_strategy: str = "random",
     ) -> None:
         self.num_hospitals = num_hospitals
+        self.num_active_hospitals = num_active_hospitals
         self.top_k = top_k
+        self.seed = seed
+        if not 1 <= num_active_hospitals <= num_hospitals:
+            raise ValueError("num_active_hospitals must be between 1 and num_hospitals")
 
         print("[CrossRare] Loading data...")
         _ensure_all_remote_files()
@@ -296,10 +315,11 @@ class CrossRareDataset:
         self.phe2emb = _load_phe2embedding()
         self.ic_dict = _load_ic_dict()
 
-        hospital_dbs, test_cases = split_and_partition(
+        hospital_dbs, val_cases, test_cases = split_and_partition(
             raw,
             num_hospitals=num_hospitals,
             test_ratio=test_ratio,
+            val_ratio=val_ratio,
             seed=seed,
             partition_strategy=partition_strategy,
         )
@@ -308,54 +328,66 @@ class CrossRareDataset:
         print(
             f"[CrossRare] Strategy='{partition_strategy}' | "
             f"Train: {sum(sizes)} cases across {num_hospitals} hospitals "
-            f"(sizes: {sizes}) | Test: {len(test_cases)}"
+            f"(sizes: {sizes}) | Val: {len(val_cases)} | Test: {len(test_cases)} | "
+            f"Agents/query: {num_active_hospitals}"
         )
 
         self.retrievers = [
             HospitalRetriever(db, self.phe2emb, self.ic_dict, hospital_id=i)
             for i, db in enumerate(hospital_dbs)
         ]
+        self.hospital_dbs = hospital_dbs
+        self.val_cases = val_cases
         self.test_cases = test_cases
+
+    def _active_retrievers(self, case_id: str) -> List[Tuple[int, HospitalRetriever]]:
+        """Choose N of the five simulated hospitals reproducibly per episode."""
+        if self.num_active_hospitals == self.num_hospitals:
+            indices = list(range(self.num_hospitals))
+        else:
+            digest = hashlib.sha256(f"{self.seed}:{case_id}".encode("utf-8")).digest()
+            indices = sorted(random.Random(int.from_bytes(digest[:8], "big")).sample(
+                range(self.num_hospitals), self.num_active_hospitals
+            ))
+        return [(index, self.retrievers[index]) for index in indices]
+
+    def _make_item(self, case: Dict, exclude_self: bool) -> Dict:
+        query_ids = case["phenotype_ids"]
+        query_phenotypes = case["phenotypes"]
+        gold = _clean_disease_name(case["disease"])
+        hospital_cases = []
+        hospital_ids = []
+        for hospital_index, retriever in self._active_retrievers(case.get("id", "")):
+            retrieved = retriever.retrieve(query_ids, self.phe2emb, self.ic_dict, top_k=self.top_k,
+                                           exclude_id=case.get("id") if exclude_self else None)
+            hospital_cases.append([{"case_disease": _clean_disease_name(r["disease"]),
+                                    "case_phenotype": ", ".join(r["phenotypes"])} for r in retrieved])
+            hospital_ids.append(hospital_index + 1)
+        return {"id": case.get("id", ""), "test_phenotypes": query_phenotypes,
+                "test_phenotype_ids": query_ids, "gold": gold,
+                "gold_aliases": _parse_disease_aliases(case["disease"]),
+                "hospital_cases": hospital_cases, "hospital_ids": hospital_ids,
+                "question": "Patient's phenotype: " + ", ".join(query_phenotypes), "solution": gold}
+
+    def train_items(self) -> List[Dict]:
+        """Train episodes with self-retrieval removed to prevent label leakage."""
+        return [self._make_item(case, exclude_self=True) for db in self.hospital_dbs for case in db]
+
+    def val_items(self) -> List[Dict]:
+        """Validation episodes; no validation record belongs to a hospital DB."""
+        return [self._make_item(case, exclude_self=False) for case in self.val_cases]
 
     def test_items(self) -> Iterable[Dict]:
         """Yield one dict per test case, with retrieval results pre-filled."""
         for case in self.test_cases:
-            query_ids = case["phenotype_ids"]
-            query_phenotypes = case["phenotypes"]
-            gold = _clean_disease_name(case["disease"])
-            gold_aliases = _parse_disease_aliases(case["disease"])
-
-            hospital_cases: List[List[Dict]] = []
-            for retriever in self.retrievers:
-                retrieved = retriever.retrieve(query_ids, self.phe2emb, self.ic_dict, top_k=self.top_k)
-                # Normalise to {case_disease, case_phenotype} format expected by prompts
-                formatted = [
-                    {
-                        "case_disease": _clean_disease_name(r["disease"]),
-                        "case_phenotype": ", ".join(r["phenotypes"]),
-                    }
-                    for r in retrieved
-                ]
-                hospital_cases.append(formatted)
-
-            # Build a simple text question for display / logging
-            question = "Patient's phenotype: " + ", ".join(query_phenotypes)
-
-            yield {
-                "id": case.get("id", ""),
-                "test_phenotypes": query_phenotypes,
-                "test_phenotype_ids": query_ids,
-                "gold": gold,
-                "gold_aliases": gold_aliases,   # all valid names for this disease
-                "hospital_cases": hospital_cases,
-                "question": question,
-                "solution": gold,
-            }
+            yield self._make_item(case, exclude_self=False)
 
 
 def load_crossrare(
     num_hospitals: int = 5,
-    test_ratio: float = 0.1,
+    num_active_hospitals: int = 3,
+    test_ratio: float = 0.05,
+    val_ratio: float = 0.05,
     top_k: int = 3,
     seed: int = 42,
     partition_strategy: str = "random",
@@ -363,7 +395,9 @@ def load_crossrare(
     """Thin wrapper for use in run.py — returns a list of test items."""
     ds = CrossRareDataset(
         num_hospitals=num_hospitals,
+        num_active_hospitals=num_active_hospitals,
         test_ratio=test_ratio,
+        val_ratio=val_ratio,
         top_k=top_k,
         seed=seed,
         partition_strategy=partition_strategy,

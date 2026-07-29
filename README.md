@@ -205,6 +205,42 @@ python run.py --method text_mas --model_name Qwen/Qwen3-14B --task gsm8k --promp
 python run.py --method latent_mas --model_name Qwen/Qwen3-14B --task gsm8k --prompt sequential --max_samples -1 --max_new_tokens 2048
 ```
 
+### MedLatentDx-H on CrossRare
+
+`raredisease_mas` is the training-free raw-KV baseline.  The Section 3.2
+MedLatentDx-H implementation is separate: it freezes the Qwen backbone and
+trains only the bias-free LayerNorm/linear distiller plus BOP/EOP boundary
+embeddings.  Each hospital transmits exactly `latent_steps + 2` KV positions
+(BOP, compact latent suffix, EOP), regardless of its local prompt length.
+
+Train the latent interface on a 90/5/5 train/validation/test split. The 90%
+public train split is partitioned into five hospital databases; each episode
+deterministically selects three hospitals and retrieves one case from each.
+The trainer saves the lowest-validation-CE checkpoint. Self-retrieval is
+excluded for training records.
+
+```bash
+python train_medlatentdx_h.py \
+  --model_name Qwen/Qwen3-8B \
+  --output_checkpoint outputs/medlatentdx_h_qwen3_8b.pt \
+  --latent_steps 32 --num_hospitals 5 --hospital_agents 3 --retrieval_top_k 1 \
+  --test_ratio 0.05 --val_ratio 0.05 \
+  --epochs 5 --batch_size 8 --warmup_steps 100 --learning_rate 1e-4 \
+  --weight_decay 0.01 --max_prompt_length 320 --max_target_length 64 --device cuda
+```
+
+Evaluate the saved interface.  Use the same model, hospital partition, seed,
+and `latent_steps` as training.
+
+```bash
+python run.py --method medlatentdx_h --task crossrare \
+  --model_name Qwen/Qwen3-8B \
+  --distiller_checkpoint outputs/medlatentdx_h_qwen3_8b.pt \
+  --latent_steps 32 --num_hospitals 5 --hospital_agents 3 --retrieval_top_k 1 \
+  --test_ratio 0.05 --val_ratio 0.05 \
+  --max_prompt_length 320 --max_new_tokens 64 --temperature 0 --generate_bs 1 --device cuda
+```
+
 #### Notes:
 
 * **`--latent_steps`** ∈ [0, 80]
