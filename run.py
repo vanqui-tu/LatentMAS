@@ -28,6 +28,8 @@ from models import ModelWrapper
 from utils import auto_device, set_seed
 import time
 
+_CROSSRARE_SOURCES = ("rarebench", "zenodo", "phenopackets26")
+
 
 def evaluate(preds: List[Dict]) -> Tuple[float, int]:
     total = len(preds)
@@ -36,11 +38,64 @@ def evaluate(preds: List[Dict]) -> Tuple[float, int]:
     return acc, correct
 
 
+def _normalize_label(value: object) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip().casefold())
+
+
+def _macro_f1(preds: List[Dict]) -> float:
+    """Macro-F1 over disease classes, preserving alias-aware correct matches."""
+    if not preds:
+        return 0.0
+
+    true_labels = [_normalize_label(p.get("gold")) for p in preds]
+    labels = sorted(set(true_labels))
+    alias_to_label = {}
+    for pred, true_label in zip(preds, true_labels):
+        for alias in pred.get("gold_aliases", [pred.get("gold", "")]):
+            alias_to_label.setdefault(_normalize_label(alias), true_label)
+
+    predicted_labels = []
+    for pred, true_label in zip(preds, true_labels):
+        if pred.get("correct", False):
+            predicted_labels.append(true_label)
+        else:
+            predicted_labels.append(
+                alias_to_label.get(_normalize_label(pred.get("prediction")), "__unknown__")
+            )
+
+    f1_scores = []
+    for label in labels:
+        tp = sum(y_true == label and y_pred == label for y_true, y_pred in zip(true_labels, predicted_labels))
+        fp = sum(y_true != label and y_pred == label for y_true, y_pred in zip(true_labels, predicted_labels))
+        fn = sum(y_true == label and y_pred != label for y_true, y_pred in zip(true_labels, predicted_labels))
+        denominator = 2 * tp + fp + fn
+        f1_scores.append((2 * tp / denominator) if denominator else 0.0)
+    return sum(f1_scores) / len(f1_scores)
+
+
+def evaluate_crossrare(preds: List[Dict]) -> Dict[str, Dict[str, float | int]]:
+    """Calculate metrics overall and for each fixed CrossRare source cohort."""
+    cohorts = {"overall": preds}
+    for source in _CROSSRARE_SOURCES:
+        cohorts[source] = [p for p in preds if p.get("source") == source]
+
+    metrics = {}
+    for name, cohort in cohorts.items():
+        accuracy, correct = evaluate(cohort)
+        metrics[name] = {
+            "accuracy": accuracy,
+            "macro_f1": _macro_f1(cohort),
+            "correct": correct,
+            "total": len(cohort),
+        }
+    return metrics
+
+
 def _safe_name(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._") or "result"
 
 
-def save_results(preds: List[Dict], args: argparse.Namespace, acc: float, correct: int, total_time: float) -> None:
+def save_results(preds: List[Dict], args: argparse.Namespace, metrics: Dict[str, Dict[str, float | int]], total_time: float) -> None:
     output_dir = os.path.abspath(args.output_dir)
     os.makedirs(output_dir, exist_ok=True)
 
@@ -48,13 +103,13 @@ def save_results(preds: List[Dict], args: argparse.Namespace, acc: float, correc
     ts = time.strftime("%Y%m%d_%H%M%S")
     results_path = os.path.join(output_dir, f"{args.method}_{model_name}_{ts}_results.json")
     summary_path = os.path.join(output_dir, f"{args.method}_{model_name}_{ts}_summary.json")
-    jsonl_path = os.path.join(output_dir, f"{args.method}_{model_name}_{ts}_results.jsonl")
 
     rows = []
     for item in preds:
         rows.append(
             {
                 "id": item.get("id", ""),
+                "source": item.get("source", ""),
                 "ground_truth": item.get("gold", ""),
                 "predicted_text": item.get("prediction", ""),
                 "correct": bool(item.get("correct", False)),
@@ -66,10 +121,6 @@ def save_results(preds: List[Dict], args: argparse.Namespace, acc: float, correc
     with open(results_path, "w", encoding="utf-8") as f:
         json.dump(rows, f, ensure_ascii=False, indent=2)
 
-    with open(jsonl_path, "w", encoding="utf-8") as f:
-        for row in rows:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
-
     summary = {
         "method": args.method,
         "model": args.model_name,
@@ -77,14 +128,11 @@ def save_results(preds: List[Dict], args: argparse.Namespace, acc: float, correc
         "split": args.split,
         "seed": args.seed,
         "max_samples": args.max_samples,
-        "accuracy": acc,
-        "correct": correct,
-        "total": len(preds),
+        "metrics": metrics,
         "total_time_sec": round(total_time, 4),
         "time_per_sample_sec": round(total_time / max(len(preds), 1), 4),
         "output_dir": output_dir,
         "results_json": results_path,
-        "results_jsonl": jsonl_path,
     }
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
@@ -171,7 +219,7 @@ def main():
     parser.add_argument("--think", action="store_true", help="Manually add think token in the prompt for LatentMAS")
     parser.add_argument("--latent_space_realign", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--output_dir", type=str, default="./outputs/run_results", help="Directory to save JSON/JSONL evaluation outputs")
+    parser.add_argument("--output_dir", type=str, default="./outputs/run_results", help="Directory to save JSON evaluation outputs")
 
     # CrossRare / raredisease_mas specific args
     parser.add_argument("--num_hospitals", type=int, default=5, help="Number of simulated hospital databases for CrossRare")
@@ -337,8 +385,12 @@ def main():
     
     total_time = time.time() - start_time
 
-    acc, correct = evaluate(preds)
-    save_results(preds, args, acc, correct, total_time)
+    if args.task == "crossrare":
+        metrics = evaluate_crossrare(preds)
+    else:
+        acc, correct = evaluate(preds)
+        metrics = {"overall": {"accuracy": acc, "correct": correct, "total": len(preds)}}
+    save_results(preds, args, metrics, total_time)
     
     # Load results in JSON format
     print(
@@ -349,8 +401,7 @@ def main():
                 "split": args.split,
                 "seed": args.seed,
                 "max_samples": args.max_samples,
-                "accuracy": acc,
-                "correct": correct,
+                "metrics": metrics,
                 "total_time_sec": round(total_time,4),
                 "time_per_sample_sec": round(total_time / max(args.max_samples, 1), 4),
             },

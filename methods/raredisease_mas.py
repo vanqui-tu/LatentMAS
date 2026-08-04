@@ -427,6 +427,7 @@ class RarediseaseMASMethod:
 
         return {
             "id": item.get("id", ""),
+            "source": item.get("source", ""),
             "question": item["question"],
             "gold": gold,
             "gold_aliases": gold_aliases,

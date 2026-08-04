@@ -261,7 +261,8 @@ class MedLatentDxHMethod:
             pred = _extract_answer_tag(raw)
             gold = item["gold"]
             results.append({
-                "id": item.get("id", ""), "question": item["question"], "gold": gold,
+                "id": item.get("id", ""), "source": item.get("source", ""),
+                "question": item["question"], "gold": gold,
                 "gold_aliases": item.get("gold_aliases", [gold]), "solution": item.get("solution", gold),
                 "prediction": pred, "raw_prediction": raw, "tag_found": "<answer>" in raw.lower(),
                 "correct": _disease_match(pred, gold, item.get("gold_aliases", [gold])),

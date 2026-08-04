@@ -1,7 +1,7 @@
 """
 CrossRare data loading, hospital partitioning, and HPO-based retrieval.
 
-Data format (data_crossrare.json):
+Data format (data_crossrare_v2.json):
   List of dicts with keys:
     - id: str
     - phenotype_ids: List[str]   (HP:XXXXXXX)
@@ -33,7 +33,7 @@ import numpy as np
 # ────────────────────────────────────────────────────────────────────────────
 
 _DATA_DIR = Path(__file__).parent / "data_CROSSRARE"
-_DATA_FILE = _DATA_DIR / "data_crossrare.json"
+_DATA_FILE = _DATA_DIR / "data_crossrare_v2.json"
 _PHE2EMB_FILE = _DATA_DIR / "phe2embedding.json"
 _IC_FILE = _DATA_DIR / "ic_dict.json"
 _DISEASE_MAP_FILE = _DATA_DIR / "disease_mapping.json"
@@ -365,7 +365,8 @@ class CrossRareDataset:
             hospital_cases.append([{"case_disease": _clean_disease_name(r["disease"]),
                                     "case_phenotype": ", ".join(r["phenotypes"])} for r in retrieved])
             hospital_ids.append(hospital_index + 1)
-        return {"id": case.get("id", ""), "test_phenotypes": query_phenotypes,
+        return {"id": case.get("id", ""), "source": case.get("source", ""),
+                "test_phenotypes": query_phenotypes,
                 "test_phenotype_ids": query_ids, "gold": gold,
                 "gold_aliases": _parse_disease_aliases(case["disease"]),
                 "hospital_cases": hospital_cases, "hospital_ids": hospital_ids,
