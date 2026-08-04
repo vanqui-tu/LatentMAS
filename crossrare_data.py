@@ -10,7 +10,7 @@ Data format (data_crossrare_v2.json):
     - disease: str               (primary disease name — used as gold label)
 
 Split: 9/10 train (distributed across hospitals), 1/10 test.
-Hospitals: 5 hospitals, each receives an equal partition of the train split.
+Hospitals: 5 hospitals receive partitions of the train split.
 
 Retrieval: For a query case, compute a weighted dot-product similarity between
 the query's HPO embedding and each database case's HPO embedding.
@@ -176,6 +176,55 @@ def _clean_disease_name(raw: str) -> str:
     return aliases[0] if aliases else raw.strip()
 
 
+def _disease_partition_key(case: Dict) -> str:
+    """Return the OMIM disease label used for disease-level partitioning."""
+    disease_ids = case.get("disease_ids") or []
+    if disease_ids:
+        return str(disease_ids[0])
+    # This fallback keeps the partitioner usable with minimally formatted data.
+    return str(case.get("disease", ""))
+
+
+def _skewed_dirichlet_partition(
+    train_cases: List[Dict],
+    num_hospitals: int,
+    alpha: float,
+    seed: int,
+) -> List[List[Dict]]:
+    """Allocate each OMIM disease across hospitals with a Dirichlet draw.
+
+    Integer counts use largest-fractional-remainder rounding, so every case is
+    assigned exactly once while retaining the sampled disease-level proportions.
+    """
+    if alpha <= 0:
+        raise ValueError("skewed_dirichlet_alpha must be positive")
+
+    cases_by_disease: Dict[str, List[Dict]] = {}
+    for case in train_cases:
+        cases_by_disease.setdefault(_disease_partition_key(case), []).append(case)
+
+    allocation_rng = np.random.default_rng(seed)
+    hospital_dbs: List[List[Dict]] = [[] for _ in range(num_hospitals)]
+    for disease in sorted(cases_by_disease):
+        cases = list(cases_by_disease[disease])
+        # Paper protocol: shuffle each disease's cases with the experiment seed.
+        random.Random(seed).shuffle(cases)
+        proportions = allocation_rng.dirichlet(np.full(num_hospitals, alpha))
+        expected_counts = proportions * len(cases)
+        counts = np.floor(expected_counts).astype(int)
+        remainder = len(cases) - int(counts.sum())
+        for hospital_index in sorted(
+            range(num_hospitals), key=lambda i: (-float(expected_counts[i] - counts[i]), i)
+        )[:remainder]:
+            counts[hospital_index] += 1
+
+        offset = 0
+        for hospital_index, count in enumerate(counts):
+            hospital_dbs[hospital_index].extend(cases[offset:offset + int(count)])
+            offset += int(count)
+    return hospital_dbs
+
+
 def split_and_partition(
     data: List[Dict],
     num_hospitals: int = 5,
@@ -183,6 +232,7 @@ def split_and_partition(
     val_ratio: float = 0.0,
     seed: int = 42,
     partition_strategy: str = "random",
+    skewed_dirichlet_alpha: float = 0.3,
 ) -> Tuple:
     """Shuffle, split train/validation/test, then distribute train hospitals.
 
@@ -191,8 +241,8 @@ def split_and_partition(
                         (sizes vary slightly around N/H).
       - "round_robin" : cases assigned in interleaved order 0,1,...,H-1,0,1,...
                         (most uniform disease distribution).
-      - "chunk"       : contiguous block per hospital after shuffle
-                        (simple; may have mild locality bias).
+      - "skewed"      : sample a per-OMIM-disease Dirichlet allocation, using
+                        ``skewed_dirichlet_alpha`` (paper setting: 0.3).
 
     Returns:
         hospital_dbs: List[num_hospitals] of case lists (train partition).
@@ -222,10 +272,15 @@ def split_and_partition(
         for case in train_cases:
             hospital_dbs[rng.randrange(num_hospitals)].append(case)
 
+    elif partition_strategy == "skewed":
+        hospital_dbs = _skewed_dirichlet_partition(
+            train_cases, num_hospitals, skewed_dirichlet_alpha, seed
+        )
+
     else:
         raise ValueError(
             f"Unknown partition_strategy '{partition_strategy}'. "
-            "Choose from: 'random', 'round_robin'."
+            "Choose from: 'random', 'round_robin', 'skewed'."
         )
 
     if val_ratio:
@@ -301,6 +356,7 @@ class CrossRareDataset:
         top_k: int = 3,
         seed: int = 42,
         partition_strategy: str = "random",
+        skewed_dirichlet_alpha: float = 0.3,
     ) -> None:
         self.num_hospitals = num_hospitals
         self.num_active_hospitals = num_active_hospitals
@@ -331,11 +387,13 @@ class CrossRareDataset:
             val_ratio=val_ratio,
             seed=seed,
             partition_strategy=partition_strategy,
+            skewed_dirichlet_alpha=skewed_dirichlet_alpha,
         )
 
         sizes = [len(h) for h in hospital_dbs]
         print(
             f"[CrossRare] Strategy='{partition_strategy}' | "
+            f"Skewed alpha: {skewed_dirichlet_alpha if partition_strategy == 'skewed' else 'n/a'} | "
             f"Train: {sum(sizes)} cases across {num_hospitals} hospitals "
             f"(sizes: {sizes}) | Val: {len(val_cases)} | Test: {len(test_cases)} | "
             f"Retrieval hospitals: {self.agent_hospital_ids} | Agents/query: {num_active_hospitals}"
@@ -404,6 +462,7 @@ def load_crossrare(
     top_k: int = 3,
     seed: int = 42,
     partition_strategy: str = "random",
+    skewed_dirichlet_alpha: float = 0.3,
 ) -> Iterable[Dict]:
     """Thin wrapper for use in run.py — returns a list of test items."""
     ds = CrossRareDataset(
@@ -415,5 +474,6 @@ def load_crossrare(
         top_k=top_k,
         seed=seed,
         partition_strategy=partition_strategy,
+        skewed_dirichlet_alpha=skewed_dirichlet_alpha,
     )
     return list(ds.test_items())

@@ -9,7 +9,10 @@ Use this note as the working context for CrossRare experiments in this repo.
   `phenopackets26`.
 - `CrossRareDataset` in `crossrare_data.py` makes a seeded `90/5/5`
   train/validation/test split. Only the train split is partitioned into five
-  private hospital databases.
+  private hospital databases. `--partition_strategy skewed` creates the
+  paper's disease-skewed partition: cases are grouped by OMIM label, allocated
+  with a symmetric Dirichlet distribution (`--skewed_dirichlet_alpha 0.3` by
+  default), then rounded by largest fractional remainders.
 - Retrieval is HPO embedding nearest-neighbour search: IC-weighted mean HPO
   vectors followed by dot-product ranking. Retrieved records are formatted as
   disease and phenotype text; original case text is not sent to the host.
@@ -80,6 +83,17 @@ python run.py --method raredisease_mas --model_name Qwen/Qwen3-4B-Instruct-2507 
   --agent_hospital_ids 1 2 3 --retrieval_top_k 1 \
   --test_ratio 0.05 --val_ratio 0.05 --partition_strategy round_robin \
   --latent_steps 0 --temperature 0 --max_new_tokens 64 --generate_bs 1 --seed 42
+```
+
+Skewed hospital retrieval (paper setting):
+
+```bash
+python run.py --method raredisease_mas --model_name Qwen/Qwen3-4B-Instruct-2507 \
+  --task crossrare --num_hospitals 5 --hospital_agents 3 \
+  --agent_hospital_ids 1 2 3 --retrieval_top_k 1 \
+  --test_ratio 0.05 --val_ratio 0.05 --partition_strategy skewed \
+  --skewed_dirichlet_alpha 0.3 --latent_steps 0 --temperature 0 \
+  --max_new_tokens 64 --generate_bs 1 --seed 42
 ```
 
 Train and evaluate MedLatentDx-H using the matching commands in `README.md`.

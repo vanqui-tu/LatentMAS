@@ -233,6 +233,11 @@ python train_medlatentdx_h.py \
 Evaluate the saved interface.  Use the same model, hospital partition, seed,
 and `latent_steps` as training.
 
+For the paper's disease-skewed retrieval setting, add
+`--partition_strategy skewed --skewed_dirichlet_alpha 0.3` to both the training
+and evaluation commands. This groups train cases by OMIM disease label and
+uses the same seeded per-disease Dirichlet allocation at both stages.
+
 ```bash
 python run.py --method medlatentdx_h --task crossrare \
   --model_name Qwen/Qwen3-8B \

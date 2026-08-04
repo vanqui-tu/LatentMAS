@@ -23,7 +23,9 @@ def main() -> None:
     parser.add_argument("--retrieval_top_k", type=int, default=1)
     parser.add_argument("--test_ratio", type=float, default=0.05)
     parser.add_argument("--val_ratio", type=float, default=0.05)
-    parser.add_argument("--partition_strategy", choices=["random", "round_robin"], default="random")
+    parser.add_argument("--partition_strategy", choices=["random", "round_robin", "skewed"], default="random")
+    parser.add_argument("--skewed_dirichlet_alpha", type=float, default=0.3,
+                        help="Per-disease Dirichlet alpha for the skewed partition (paper: 0.3).")
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
@@ -62,7 +64,8 @@ def main() -> None:
                                agent_hospital_ids=args.agent_hospital_ids,
                                test_ratio=args.test_ratio, val_ratio=args.val_ratio,
                                top_k=args.retrieval_top_k, seed=args.seed,
-                               partition_strategy=args.partition_strategy)
+                               partition_strategy=args.partition_strategy,
+                               skewed_dirichlet_alpha=args.skewed_dirichlet_alpha)
     examples = dataset.train_items()
     total_query_examples = len(examples)
     if args.max_train_samples > 0:

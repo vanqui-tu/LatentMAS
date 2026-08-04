@@ -318,7 +318,7 @@ class MedLatentDxHMethod:
             return_dict=True,
         )
         token_losses = F.cross_entropy(
-            output.logits[:, :-1, :].float().transpose(1, 2), labels[:, 1:],
+            output.logits[:, :-1, :].transpose(1, 2), labels[:, 1:],
             reduction="none", ignore_index=-100,
         )
         target_counts = (labels[:, 1:] != -100).sum(dim=1)

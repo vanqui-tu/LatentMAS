@@ -230,8 +230,10 @@ def main():
     parser.add_argument("--test_ratio", type=float, default=0.05, help="Fraction of CrossRare data held out for test")
     parser.add_argument("--val_ratio", type=float, default=0.05, help="Fraction of CrossRare data held out for validation")
     parser.add_argument("--partition_strategy", type=str, default="random",
-                        choices=["random", "round_robin"],
+                        choices=["random", "round_robin", "skewed"],
                         help="How to distribute train cases across hospitals")
+    parser.add_argument("--skewed_dirichlet_alpha", type=float, default=0.3,
+                        help="Per-disease Dirichlet alpha when --partition_strategy skewed (paper: 0.3)")
     parser.add_argument("--distiller_checkpoint", type=str, default=None,
                         help="Trained MedLatentDx-H distiller checkpoint.")
     parser.add_argument("--max_prompt_length", type=int, default=320,
@@ -343,6 +345,7 @@ def main():
             top_k=args.retrieval_top_k,
             seed=args.seed,
             partition_strategy=args.partition_strategy,
+            skewed_dirichlet_alpha=args.skewed_dirichlet_alpha,
         )
     else:
         raise ValueError(f'no {args.task} support')
