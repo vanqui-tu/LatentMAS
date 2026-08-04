@@ -45,8 +45,8 @@ The host emits one disease inside `<answer>...</answer>`.
 - Entry point: `train_medlatentdx_h.py`.
 - Frozen: all local/host LLM backbone parameters. Trainable: one shared
   `LayerNorm + bias-free Linear` distiller and shared BOP/EOP embeddings.
-- Default paper-aligned settings: `m=32`, AdamW (`lr=1e-4`, `wd=0.01`),
-  LambdaLR warm-up 100 optimizer updates, 5 epochs, physical batch size 8,
+- Default settings: `m=32`, AdamW (`lr=1e-4`, `wd=0.01`), 100 optimizer
+  update warm-up followed by a constant LR, 5 epochs, physical batch size 8,
   prompt limit 320, target limit 64, seed 42.
 - The trainer batches episodes physically: it encodes all three hospital prompts
   per episode together, stitches fixed-length KV suffixes per episode, and

@@ -30,6 +30,8 @@ def main() -> None:
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--warmup_steps", type=int, default=100)
+    parser.add_argument("--lr_schedule", choices=["constant", "linear"], default="constant",
+                        help="Learning-rate schedule after warm-up; linear decays to zero by the final update.")
     parser.add_argument("--batch_size", type=int, default=8,
                         help="Physical GPU batch size in episodes.")
     parser.add_argument("--grad_accumulation", type=int, default=1,
@@ -87,9 +89,21 @@ def main() -> None:
     # Accumulation preserves the effective batch size when a larger GPU batch does
     # not fit in memory.
     update_size = args.batch_size * args.grad_accumulation
+    updates_per_epoch = (len(examples) + update_size - 1) // update_size
+    total_updates = updates_per_epoch * args.epochs
+
+    def lr_multiplier(step: int) -> float:
+        if step < args.warmup_steps:
+            return float(step + 1) / max(1, args.warmup_steps)
+        if args.lr_schedule == "constant":
+            return 1.0
+        decay_steps = max(1, total_updates - args.warmup_steps)
+        progress = min(1.0, float(step - args.warmup_steps + 1) / decay_steps)
+        return 1.0 - progress
+
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer,
-        lr_lambda=lambda step: min(1.0, float(step + 1) / max(1, args.warmup_steps)),
+        lr_lambda=lr_multiplier,
     )
 
     method.distiller.train()
@@ -101,7 +115,6 @@ def main() -> None:
         mean_loss = 0.0
         update_loss = 0.0
         update_examples = 0
-        updates_per_epoch = (len(examples) + update_size - 1) // update_size
         for update_start in range(0, len(examples), update_size):
             update_items = examples[update_start:update_start + update_size]
             chunk_size = len(update_items)
