@@ -69,6 +69,10 @@ Disease matching in `raredisease_mas.py` accepts, in order:
 2. Substring match when both strings have at least five characters.
 3. At least 70% coverage of a multi-word gold alias by predicted words.
 
+Fuzzy matching requires numeric identifiers to agree exactly, so disease
+subtypes that differ only by a number are not conflated. When a response has
+multiple `<answer>` tags, the final non-empty tag is evaluated.
+
 Results are saved as a per-case JSON and summary JSON under `--output_dir`.
 For CrossRare, the summary reports accuracy and macro-F1 for `overall` and
 each source cohort (`rarebench`, `zenodo`, `phenopackets26`).

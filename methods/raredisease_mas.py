@@ -46,13 +46,19 @@ from crossrare_data import _parse_disease_aliases
 def _extract_answer_tag(text: str) -> Optional[str]:
     """Extract content from <answer>...</answer> tags.
 
-    Falls back to the last non-empty line if no tags found.
+    When multiple answer tags are present, uses the final non-empty tag because
+    it represents the model's final revision. Falls back to the last non-empty
+    line if no tags are found.
     Also strips common model preambles like 'The diagnosis is:'.
     """
     # Primary: <answer> tags (as instructed in template C)
-    m = re.search(r"<answer>\s*(.*?)\s*</answer>", text, re.IGNORECASE | re.DOTALL)
-    if m:
-        return m.group(1).strip()
+    tagged_answers = [
+        answer.strip()
+        for answer in re.findall(r"<answer>\s*(.*?)\s*</answer>", text, re.IGNORECASE | re.DOTALL)
+        if answer.strip()
+    ]
+    if tagged_answers:
+        return tagged_answers[-1]
 
     # Secondary: last non-empty line (model may not follow template)
     lines = [l.strip() for l in text.strip().splitlines() if l.strip()]
@@ -73,6 +79,11 @@ def _normalize_disease(name: str) -> str:
     # Collapse multiple spaces
     name = re.sub(r"\s+", " ", name)
     return name
+
+
+def _numeric_identifiers(name: str) -> Tuple[str, ...]:
+    """Return numeric identifiers that distinguish similarly named diseases."""
+    return tuple(sorted(set(re.findall(r"\d+(?:\.\d+)?", name))))
 
 
 def _disease_match(pred: Optional[str], gold: str, gold_aliases: Optional[List[str]] = None) -> bool:
@@ -100,6 +111,11 @@ def _disease_match(pred: Optional[str], gold: str, gold_aliases: Optional[List[s
         # Level 1: exact
         if p == g:
             return True
+
+        # Numeric disease subtypes are discriminative. A missing or different
+        # number makes fuzzy matching unsafe, but exact aliases above still pass.
+        if _numeric_identifiers(p) != _numeric_identifiers(g):
+            continue
 
         # Level 2: substring
         if len(p) >= 5 and len(g) >= 5:
