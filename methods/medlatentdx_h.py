@@ -12,6 +12,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from models import ModelWrapper, _as_transformers_cache, _past_length, _positions_from_mask
 from methods.raredisease_mas import (
@@ -146,8 +147,8 @@ class MedLatentDxHMethod:
             ])
         return messages
 
-    def _encode_hospitals(self, messages: List[List[Dict]]) -> List[Tuple]:
-        """Create each hospital's compact suffix M-tilde_Hi, never its prompt KV."""
+    def _encode_hospital_messages(self, messages: List[List[Dict]]) -> Tuple:
+        """Encode a batch of hospital prompts into compact latent KV suffixes."""
         prompts = [self.model.render_chat(message, add_generation_prompt=True) for message in messages]
         encoded = self.model.tokenizer(
             prompts, return_tensors="pt", padding=True, truncation=True,
@@ -180,8 +181,13 @@ class MedLatentDxHMethod:
             past = out.past_key_values
             hidden = out.hidden_states[-1][:, -1, :]
 
-        # Each batch row's compact suffix has fixed m positions, so no prompt padding remains.
-        compact_batch = _last_kv_positions(past, self.latent_steps)
+        # Every batch row's compact suffix has fixed m positions and no prompt padding.
+        return _last_kv_positions(past, self.latent_steps)
+
+    def _encode_hospitals(self, messages: List[List[Dict]]) -> List[Tuple]:
+        """Create each hospital's compact suffix M-tilde_Hi, never its prompt KV."""
+        compact_batch = self._encode_hospital_messages(messages)
+        batch = compact_batch[0][0].shape[0]
         return [
             tuple(tuple(value[i : i + 1].contiguous() for value in layer) for layer in compact_batch)
             for i in range(batch)
@@ -197,6 +203,19 @@ class MedLatentDxHMethod:
         )
         return out.past_key_values
 
+    def _boundary_cache_batch(self, embedding: torch.Tensor, batch_size: int) -> Tuple:
+        """Materialise one learned boundary KV block per episode in a batch."""
+        embeddings = embedding.expand(batch_size, -1, -1).to(
+            device=self.model.device, dtype=_model_dtype(self.model.model)
+        )
+        out = self.model.model(
+            inputs_embeds=embeddings,
+            attention_mask=torch.ones(batch_size, 1, dtype=torch.long, device=self.model.device),
+            use_cache=True,
+            return_dict=True,
+        )
+        return out.past_key_values
+
     def _combined_compact_cache(self, item: Dict) -> Tuple:
         compact = self._encode_hospitals(self._hospital_messages(item))
         bop = self._boundary_cache(self.distiller.bop)
@@ -206,35 +225,104 @@ class MedLatentDxHMethod:
             blocks.extend([bop, local_cache, eop])
         return _concat_kv_list(blocks)
 
+    def _combined_compact_cache_batch(self, items: List[Dict]) -> Tuple:
+        """Build one stitched [batch, KV] cache per episode without per-row slicing."""
+        if not items:
+            raise ValueError("items must not be empty")
+        hospital_count = len(items[0]["hospital_cases"])
+        if hospital_count == 0 or any(len(item["hospital_cases"]) != hospital_count for item in items):
+            raise ValueError("all items must contain the same non-zero number of hospitals")
+
+        messages = [
+            message
+            for item in items
+            for message in self._hospital_messages(item)
+        ]
+        batch_size = len(items)
+        compact = self._encode_hospital_messages(messages)
+        bop = self._boundary_cache_batch(self.distiller.bop, batch_size)
+        eop = self._boundary_cache_batch(self.distiller.eop, batch_size)
+
+        stitched_layers = []
+        for compact_layer, bop_layer, eop_layer in zip(compact, bop, eop):
+            stitched_values = []
+            for compact_value, bop_value, eop_value in zip(compact_layer, bop_layer, eop_layer):
+                # [B * H, heads, m, dim] -> [B, heads, H * (m + 2), dim]
+                grouped = compact_value.reshape(batch_size, hospital_count, *compact_value.shape[1:])
+                bop_blocks = bop_value.unsqueeze(1).expand(-1, hospital_count, -1, -1, -1)
+                eop_blocks = eop_value.unsqueeze(1).expand(-1, hospital_count, -1, -1, -1)
+                blocks = torch.cat([bop_blocks, grouped, eop_blocks], dim=3)
+                stitched_values.append(
+                    blocks.permute(0, 2, 1, 3, 4).reshape(
+                        batch_size, blocks.shape[2], -1, blocks.shape[-1]
+                    )
+                )
+            stitched_layers.append(tuple(stitched_values))
+        return tuple(stitched_layers)
+
     def diagnosis_loss(self, item: Dict) -> torch.Tensor:
         """Equation 6: CE only on the host answer, never on latent positions."""
-        compact_cache = self._combined_compact_cache(item)
-        query = ", ".join(item["test_phenotypes"])
-        host = self.model.render_chat(build_crossrare_host_prompt(query), add_generation_prompt=True)
-        target = f"<answer>{item['gold']}</answer>{self.model.tokenizer.eos_token or ''}"
+        return self.diagnosis_loss_batch([item])
+
+    def diagnosis_loss_batch(self, items: List[Dict]) -> torch.Tensor:
+        """Mean teacher-forced CE for a physical batch of CrossRare episodes."""
+        if not items:
+            raise ValueError("items must not be empty")
+        compact_cache = self._combined_compact_cache_batch(items)
+        hosts = [
+            self.model.render_chat(
+                build_crossrare_host_prompt(", ".join(item["test_phenotypes"])),
+                add_generation_prompt=True,
+            )
+            for item in items
+        ]
+        targets = [
+            f"<answer>{item['gold']}</answer>{self.model.tokenizer.eos_token or ''}"
+            for item in items
+        ]
         host_ids = self.model.tokenizer(
-            host, return_tensors="pt", truncation=True,
-            max_length=self.max_prompt_length, add_special_tokens=False,
-        )["input_ids"].to(self.model.device)
+            hosts, truncation=True, max_length=self.max_prompt_length,
+            add_special_tokens=False,
+        )["input_ids"]
         target_ids = self.model.tokenizer(
-            target, return_tensors="pt", truncation=True,
-            max_length=self.max_target_length, add_special_tokens=False,
-        )["input_ids"].to(self.model.device)
-        current_ids = torch.cat([host_ids, target_ids], dim=1)
+            targets, truncation=True, max_length=self.max_target_length,
+            add_special_tokens=False,
+        )["input_ids"]
+        sequence_lengths = [len(host) + len(target) for host, target in zip(host_ids, target_ids)]
+        current_length = max(sequence_lengths)
+        batch_size = len(items)
+        current_ids = torch.full(
+            (batch_size, current_length), self.model.tokenizer.pad_token_id,
+            dtype=torch.long, device=self.model.device,
+        )
+        current_mask = torch.zeros_like(current_ids)
+        labels = torch.full_like(current_ids, -100)
+        for index, (host, target) in enumerate(zip(host_ids, target_ids)):
+            sequence = host + target
+            start = current_length - len(sequence)
+            target_start = current_length - len(target)
+            current_ids[index, start:] = torch.tensor(sequence, dtype=torch.long, device=self.model.device)
+            current_mask[index, start:] = 1
+            labels[index, target_start:] = torch.tensor(target, dtype=torch.long, device=self.model.device)
+
         inputs = self.model.model.get_input_embeddings()(current_ids)
-        labels = torch.cat([torch.full_like(host_ids, -100), target_ids], dim=1)
         past_len = _past_length(compact_cache)
-        mask = torch.ones(1, past_len + current_ids.shape[1], dtype=torch.long, device=self.model.device)
+        past_mask = torch.ones(batch_size, past_len, dtype=current_mask.dtype, device=self.model.device)
+        mask = torch.cat([past_mask, current_mask], dim=1)
         output = self.model.model(
             inputs_embeds=inputs,
             attention_mask=mask,
             position_ids=_positions_from_mask(mask, current_ids.shape[1]),
             past_key_values=_as_transformers_cache(compact_cache),
-            labels=labels,
             use_cache=False,
             return_dict=True,
         )
-        return output.loss
+        token_losses = F.cross_entropy(
+            output.logits[:, :-1, :].float().transpose(1, 2), labels[:, 1:],
+            reduction="none", ignore_index=-100,
+        )
+        target_counts = (labels[:, 1:] != -100).sum(dim=1)
+        return (token_losses.sum(dim=1) / target_counts).mean()
 
     @torch.no_grad()
     def run_batch(self, items: List[Dict]) -> List[Dict]:
