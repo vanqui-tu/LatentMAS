@@ -45,14 +45,12 @@ The host emits one disease inside `<answer>...</answer>`.
 - Entry point: `train_medlatentdx_h.py`.
 - Frozen: all local/host LLM backbone parameters. Trainable: one shared
   `LayerNorm + bias-free Linear` distiller and shared BOP/EOP embeddings.
-- Default settings: `m=32`, AdamW (`lr=1e-4`, `wd=0.01`), 100 optimizer
-  update warm-up followed by a constant LR, 5 epochs, physical batch size 8,
+- Default paper-aligned settings: `m=32`, AdamW (`lr=1e-4`, `wd=0.01`),
+  LambdaLR warm-up 100 optimizer updates, 5 epochs, effective batch size 8,
   prompt limit 320, target limit 64, seed 42.
-- The trainer batches episodes physically: it encodes all three hospital prompts
-  per episode together, stitches fixed-length KV suffixes per episode, and
-  computes host CE in one padded batch. `--grad_accumulation` optionally grows
-  the effective batch beyond the physical GPU batch. Progress prints after every
-  optimizer update by default.
+- Episodes are processed one at a time and their losses are accumulated before
+  an optimizer update. This is an effective batch of 8, not a vectorized
+  padded-KV batch. Progress prints after every optimizer update by default.
 - Validation CE selects the checkpoint. Checkpoints contain only distiller
   weights (`norm`, `projection`, `bop`, `eop`) and small shape/config metadata,
   never LLM weights.

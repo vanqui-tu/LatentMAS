@@ -33,9 +33,8 @@ def main() -> None:
     parser.add_argument("--lr_schedule", choices=["constant", "linear"], default="constant",
                         help="Learning-rate schedule after warm-up; linear decays to zero by the final update.")
     parser.add_argument("--batch_size", type=int, default=8,
-                        help="Physical GPU batch size in episodes.")
-    parser.add_argument("--grad_accumulation", type=int, default=1,
-                        help="Number of physical batches accumulated per AdamW update.")
+                        help="Episodes accumulated per AdamW update; caches are not padded together.")
+    parser.add_argument("--grad_accumulation", type=int, default=1)
     parser.add_argument("--log_every", type=int, default=1,
                         help="Print training metrics every N optimizer updates.")
     parser.add_argument("--max_prompt_length", type=int, default=320)
@@ -85,9 +84,8 @@ def main() -> None:
         flush=True,
     )
 
-    # Each physical batch uses padded prompts but fixed-length compact KV blocks.
-    # Accumulation preserves the effective batch size when a larger GPU batch does
-    # not fit in memory.
+    # Each episode has a different stitched cache length. Accumulating their
+    # gradients is mathematically equivalent to a padded batch for this loss.
     update_size = args.batch_size * args.grad_accumulation
     updates_per_epoch = (len(examples) + update_size - 1) // update_size
     total_updates = updates_per_epoch * args.epochs
@@ -115,43 +113,35 @@ def main() -> None:
         mean_loss = 0.0
         update_loss = 0.0
         update_examples = 0
-        for update_start in range(0, len(examples), update_size):
-            update_items = examples[update_start:update_start + update_size]
-            chunk_size = len(update_items)
-            for batch_start in range(0, chunk_size, args.batch_size):
-                batch = update_items[batch_start:batch_start + args.batch_size]
-                loss = method.diagnosis_loss_batch(batch)
-                # ``loss`` is a mean over this physical batch; weight it by the
-                # number of episodes so the update remains a mean over its chunk.
-                (loss * (len(batch) / chunk_size)).backward()
-                loss_value = float(loss.detach())
-                mean_loss += loss_value * len(batch)
-                update_loss += loss_value * len(batch)
-                update_examples += len(batch)
-
-            torch.nn.utils.clip_grad_norm_(method.distiller.parameters(), 1.0)
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad(set_to_none=True)
-            global_update += 1
-            epoch_update = update_start // update_size + 1
-            if global_update % args.log_every == 0:
-                print(
-                    f"epoch={epoch + 1}/{args.epochs} "
-                    f"update={epoch_update}/{updates_per_epoch} global_update={global_update} "
-                    f"train_ce={update_loss / update_examples:.6f} "
-                    f"lr={scheduler.get_last_lr()[0]:.2e}",
-                    flush=True,
-                )
-            update_loss = 0.0
-            update_examples = 0
+        updates_per_epoch = (len(examples) + update_size - 1) // update_size
+        for step, item in enumerate(examples, start=1):
+            loss = method.diagnosis_loss(item)
+            chunk_start = ((step - 1) // update_size) * update_size
+            chunk_size = min(update_size, len(examples) - chunk_start)
+            (loss / chunk_size).backward()
+            mean_loss += float(loss.detach())
+            update_loss += float(loss.detach())
+            update_examples += 1
+            if step % update_size == 0 or step == len(examples):
+                torch.nn.utils.clip_grad_norm_(method.distiller.parameters(), 1.0)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+                global_update += 1
+                epoch_update = (step + update_size - 1) // update_size
+                if global_update % args.log_every == 0:
+                    print(
+                        f"epoch={epoch + 1}/{args.epochs} "
+                        f"update={epoch_update}/{updates_per_epoch} global_update={global_update} "
+                        f"train_ce={update_loss / update_examples:.6f} "
+                        f"lr={scheduler.get_last_lr()[0]:.2e}",
+                        flush=True,
+                    )
+                update_loss = 0.0
+                update_examples = 0
         method.distiller.eval()
         with torch.no_grad():
-            validation_total = 0.0
-            for batch_start in range(0, len(validation_examples), args.batch_size):
-                batch = validation_examples[batch_start:batch_start + args.batch_size]
-                validation_total += float(method.diagnosis_loss_batch(batch)) * len(batch)
-            validation_loss = validation_total / len(validation_examples)
+            validation_loss = sum(float(method.diagnosis_loss(item)) for item in validation_examples) / len(validation_examples)
         print(f"epoch={epoch + 1} train_ce={mean_loss / len(examples):.6f} val_ce={validation_loss:.6f} lr={scheduler.get_last_lr()[0]:.2e}")
         if validation_loss < best_validation_loss:
             best_validation_loss = validation_loss
